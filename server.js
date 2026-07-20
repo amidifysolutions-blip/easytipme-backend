@@ -68,9 +68,10 @@ app.post('/create-payment-intent', async (req, res) => {
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amount,        // مثال: 1000 = $10.00
       currency: currency || 'cad',
-      automatic_payment_methods: {
-        enabled: true,
-      },
+      // Card only — this removes Link, Klarna, and all extra methods from the
+      // Payment Element. Apple Pay / Google Pay are card-based, so the Express
+      // Checkout Element still shows the wallet buttons.
+      payment_method_types: ['card'],
     });
 
     res.json({

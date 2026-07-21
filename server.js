@@ -80,6 +80,38 @@ function welcomeEmailHtml(name, shopName, staffLink) {
     <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:18px 0 0;">If the button doesn't work, open this link:<br><span style="color:#0071e3;word-break:break-all;">${escapeHtml(link)}</span></p>
   </div>`);
 }
+// New worker — account was created for them; email their login + temporary password.
+function inviteCredsHtml(name, shopName, loginEmail, tempPass, shopCode, staffLink) {
+  const who = escapeHtml(name || 'there');
+  const shop = escapeHtml(shopName || 'your workplace');
+  const link = staffLink || (APP_URL + '/staff.html');
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Welcome to ${shop} &#128075;</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 14px;">Hi ${who}, your tipping account is ready. Log in with the details below — you'll set your own password on first sign-in.</p>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f7f7f9;border-radius:14px;margin:0 0 18px;">
+      <tr><td style="padding:16px 18px;font-size:14px;color:#333;line-height:1.9;text-align:left;">
+        ${shopCode ? `<div><span style="color:#8a8a90;">Workplace code:</span> <b style="letter-spacing:.06em;">${escapeHtml(shopCode)}</b></div>` : ''}
+        <div><span style="color:#8a8a90;">Login email:</span> <b>${escapeHtml(loginEmail)}</b></div>
+        <div><span style="color:#8a8a90;">Temporary password:</span> <b style="font-family:monospace;font-size:15px;letter-spacing:.04em;">${escapeHtml(tempPass)}</b></div>
+      </td></tr>
+    </table>
+    <a href="${link}" style="display:inline-block;background:#0071e3;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:13px 26px;border-radius:12px;">Open the app &amp; log in</a>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:18px 0 0;">For your security, you'll be asked to choose a new password and confirm your email the first time you log in. If you didn't expect this, you can ignore this email.</p>
+  </div>`);
+}
+// Existing worker — they already have an EasyTipMe account; just notify they were added.
+function addedToShopHtml(name, shopName, shopCode, staffLink) {
+  const who = escapeHtml(name || 'there');
+  const shop = escapeHtml(shopName || 'a workplace');
+  const link = staffLink || (APP_URL + '/staff.html');
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">You've been added to ${shop}</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 14px;">Hi ${who}, <b>${shop}</b> added you on EasyTipMe. Just log in with your existing email and password — no new account needed.</p>
+    ${shopCode ? `<div style="font-size:14px;color:#333;margin:0 0 16px;">Workplace code: <b style="letter-spacing:.06em;">${escapeHtml(shopCode)}</b></div>` : ''}
+    <a href="${link}" style="display:inline-block;background:#0071e3;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:13px 26px;border-radius:12px;">Open the app</a>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:18px 0 0;">If this wasn't expected, you can ignore this email.</p>
+  </div>`);
+}
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', app: 'EasyTipMe API' });
@@ -171,6 +203,69 @@ app.post('/notify-welcome', async (req, res) => {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// Owner invites a staff member: create their Firebase account with a TEMPORARY
+// password (or link an existing account), then email them their login details.
+// The worker never types their name/email — the owner already did. Verified
+// against the owner's ID token (uid must equal the business id).
+app.post('/staff/invite', async (req, res) => {
+  try {
+    const { idToken, bid, staffId, email, name, shopName, shopCode, staffLink } = req.body;
+    if (!idToken || !bid || !staffId || !email) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    const addr = String(email).toLowerCase();
+    let uid = null, created = false, tempPass = null;
+    try { const u = await adminAuth.getUserByEmail(addr); uid = u.uid; } catch (_) { /* no account yet */ }
+    if (!uid) {
+      tempPass = require('crypto').randomBytes(4).toString('hex'); // 8 hex chars, e.g. f8b6d3a6
+      const u = await adminAuth.createUser({ email: addr, password: tempPass, emailVerified: false, displayName: name || undefined });
+      uid = u.uid; created = true;
+    }
+    // Link the staff record to this account; flag first-login only when WE created it.
+    const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    await ref.set({ claimedUid: uid, email: addr, mustChangePassword: created, invitedAt: new Date().toISOString() }, { merge: true });
+    // Deliver the email (credentials for new workers, a heads-up for existing ones).
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    let sent = 0;
+    if (apiKey) {
+      const html = created
+        ? inviteCredsHtml(name, shopName, addr, tempPass, shopCode, staffLink)
+        : addedToShopHtml(name, shopName, shopCode, staffLink);
+      const subject = created
+        ? `Your ${shopName || 'EasyTipMe'} login`
+        : `You've been added to ${shopName || 'a workplace'} on EasyTipMe`;
+      try {
+        const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || '' }], subject, htmlContent: html })
+        });
+        sent = resp.ok ? 1 : 0;
+      } catch (e) { console.error('invite email', e.message); }
+    }
+    res.json({ created, sent });
+  } catch (e) { console.error('staff invite', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Worker finished the forced first-login password change — clear the flag.
+app.post('/staff/activate', async (req, res) => {
+  try {
+    const { idToken, bid, staffId } = req.body;
+    if (!idToken || !bid || !staffId) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'staff-not-found' });
+    if (snap.data().claimedUid !== decoded.uid) return res.status(403).json({ error: 'not-your-record' });
+    await ref.update({ mustChangePassword: false, passwordSetAt: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) { console.error('staff activate', e.message); res.status(500).json({ error: e.message }); }
 });
 
 function verifyEmailHtml(name, link) {

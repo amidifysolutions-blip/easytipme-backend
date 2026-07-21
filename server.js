@@ -4,6 +4,11 @@ const cors = require('cors');
 const Stripe = require('stripe');   // ← السطر الثالث ✔
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// The publishable key the customer tip page must use. It MUST match the mode
+// (test/live) of STRIPE_SECRET_KEY above — set both together on Render. The
+// frontend asks the backend for this so the two can never drift out of sync
+// (a mismatch makes Stripe refuse to render the card field). Public by design.
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || '';
 // Connect endpoints can use a SEPARATE key (e.g. a TEST key) so we can test
 // staff bank onboarding without touching live payments. If unset, falls back
 // to the main (live) key — which is what production will use.
@@ -131,11 +136,19 @@ app.post('/create-payment-intent', async (req, res) => {
 
     res.json({
       clientSecret: paymentIntent.client_secret,
+      // Hand the frontend the key that matches THIS intent's mode, so the
+      // customer page never uses a mismatched (test vs live) publishable key.
+      publishableKey: STRIPE_PUBLISHABLE_KEY,
     });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// Lightweight config for the customer tip page (mode-correct publishable key).
+app.get('/stripe-config', (req, res) => {
+  res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
 });
 
 // Send an email to staff when they receive a tip (via Brevo)
@@ -535,7 +548,7 @@ app.post('/connect/create-account', async (req, res) => {
         email: email || undefined,
         business_type: 'individual',
         // Pre-set the category & description so Stripe doesn't ask the worker "select your industry".
-        business_profile: { mcc: '7299', product_description: 'Tips and gratuities received through EasyTipMe.' },
+        business_profile: { mcc: '7299', url: 'https://www.easytipme.com', product_description: 'Tips and gratuities received through EasyTipMe.' },
         individual: Object.keys(individual).length ? individual : undefined,
         capabilities: { transfers: { requested: true } },
         metadata: { bid, staffId }
@@ -634,7 +647,7 @@ app.post('/connect/create-owner-account', async (req, res) => {
         type: 'express',
         country: (country || 'CA'),
         email: email || decoded.email || undefined,
-        business_profile: { mcc: '7299', product_description: 'Tips and administrative fees collected through EasyTipMe.' },
+        business_profile: { mcc: '7299', url: 'https://www.easytipme.com', product_description: 'Tips and administrative fees collected through EasyTipMe.' },
         capabilities: { transfers: { requested: true } },
         metadata: { bid, role: 'owner' }
       });

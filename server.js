@@ -343,6 +343,13 @@ app.post('/send-code', async (req, res) => {
         body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || '' }], subject: 'Your EasyTipMe confirmation code', htmlContent: emailCodeHtml(name, code) })
       });
       sent = resp.ok ? 1 : 0;
+      if (!resp.ok) {
+        const detail = await resp.text().catch(() => '');
+        console.error('send-code brevo failed', resp.status, detail);
+        return res.json({ sent: 0, error: 'send-failed', status: resp.status, detail: String(detail).slice(0, 300) });
+      }
+    } else {
+      return res.json({ sent: 0, error: 'no-brevo-key' });
     }
     res.json({ sent });
   } catch (e) { console.error('send-code', e.message); res.json({ sent: 0, error: e.message }); }

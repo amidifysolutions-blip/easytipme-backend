@@ -123,25 +123,86 @@ app.get('/health', (req, res) => {
 });
 app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { amount, currency } = req.body;
+    const { businessId, staffId, tipCents, currency, amount } = req.body;
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amount,        // مثال: 1000 = $10.00
-      currency: currency || 'cad',
-      // Card only — this removes Link, Klarna, and all extra methods from the
-      // Payment Element. Apple Pay / Google Pay are card-based, so the Express
-      // Checkout Element still shows the wallet buttons.
+    // ---- Legacy / team path -------------------------------------------------
+    // When we don't have a single recipient to route to (e.g. a team/multi tip,
+    // which we split in a later phase), fall back to a plain charge on the
+    // platform so tipping still works. No split happens here.
+    if (!businessId || !staffId || !tipCents) {
+      const pi = await stripe.paymentIntents.create({
+        amount: amount || tipCents,
+        currency: (currency || 'cad').toLowerCase(),
+        payment_method_types: ['card'],
+      });
+      return res.json({ clientSecret: pi.client_secret, publishableKey: STRIPE_PUBLISHABLE_KEY });
+    }
+
+    // ---- Direct-to-worker split (the real model) ----------------------------
+    if (!adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const tip = Math.round(Number(tipCents));
+    if (!(tip > 0)) return res.status(400).json({ error: 'bad-amount' });
+
+    // Station 1: platform commission — a % ADDED ON TOP of the tip. Admin sets
+    // it in the master dashboard (config/platform.commissionPercent).
+    let commPct = 5;
+    try {
+      const cfg = await adminDb.collection('config').doc('platform').get();
+      if (cfg.exists && cfg.data().commissionPercent != null) commPct = Number(cfg.data().commissionPercent);
+    } catch (_) {}
+    if (!(commPct >= 0)) commPct = 5;
+
+    const bizSnap = await adminDb.collection('businesses').doc(businessId).get();
+    if (!bizSnap.exists) return res.status(404).json({ error: 'shop-not-found' });
+    const biz = bizSnap.data();
+    if (biz.blocked) return res.status(403).json({ error: 'shop-unavailable' });
+    const cur = (currency || biz.currency || 'cad').toLowerCase();
+
+    const stfSnap = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(staffId).get();
+    if (!stfSnap.exists) return res.status(404).json({ error: 'staff-not-found' });
+    const staff = stfSnap.data();
+    // SECURITY: we look the worker's Connect account up server-side from their
+    // staff record — never trust an account id sent by the browser.
+    const workerAcct = staff.connectAccountId;
+    if (!workerAcct) return res.status(409).json({ error: 'recipient-not-ready' });
+
+    // Option (a): only route to a worker whose Connect account can actually
+    // receive. If not ready, reject cleanly so no money is ever mis-held.
+    let acct;
+    try { acct = await stripe.accounts.retrieve(workerAcct); }
+    catch (_) { return res.status(409).json({ error: 'recipient-not-ready' }); }
+    if (!acct.charges_enabled) return res.status(409).json({ error: 'recipient-not-ready' });
+
+    const commission = Math.round(tip * commPct / 100);   // platform keeps this
+    const total = tip + commission;                        // customer pays this
+
+    // Destination charge:
+    //  - amount (tip+commission) is charged to the customer's card
+    //  - application_fee_amount (commission) goes to the PLATFORM, in full
+    //  - the remainder (the tip) is transferred to the WORKER's account
+    //  - on_behalf_of = worker → the worker's account is the settlement
+    //    merchant, so Stripe's processing fee is borne by the worker (per your
+    //    decision), leaving the platform commission as clean profit.
+    const pi = await stripe.paymentIntents.create({
+      amount: total,
+      currency: cur,
       payment_method_types: ['card'],
+      application_fee_amount: commission,
+      on_behalf_of: workerAcct,
+      transfer_data: { destination: workerAcct },
+      metadata: {
+        businessId, staffId,
+        tip: String(tip), commission: String(commission), commissionPercent: String(commPct),
+      },
     });
 
     res.json({
-      clientSecret: paymentIntent.client_secret,
-      // Hand the frontend the key that matches THIS intent's mode, so the
-      // customer page never uses a mismatched (test vs live) publishable key.
+      clientSecret: pi.client_secret,
       publishableKey: STRIPE_PUBLISHABLE_KEY,
+      breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct },
     });
   } catch (error) {
-    console.error(error);
+    console.error('create-payment-intent', error.message);
     res.status(500).json({ error: error.message });
   }
 });

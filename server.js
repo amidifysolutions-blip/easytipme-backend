@@ -34,14 +34,17 @@ function emailShell(bodyHtml) {
   </table>
 </body></html>`;
 }
-function tipEmailHtml(name, cur, amt, shopName) {
+function tipEmailHtml(name, cur, amt, shopName, fromName) {
   const who = escapeHtml(name || 'there');
   const shop = shopName ? (' at ' + escapeHtml(shopName)) : '';
+  const from = fromName ? escapeHtml(fromName) : '';
+  const topLabel = from ? ('You just received a tip from ' + from) : 'You just received a tip';
+  const lead = from ? (from + ' just left you a tip') : 'A customer just left you a tip';
   return emailShell(`<div style="text-align:center">
-    <div style="font-size:15px;color:#6e6e73;margin-bottom:6px;">You just received a tip</div>
+    <div style="font-size:15px;color:#6e6e73;margin-bottom:6px;">${topLabel}</div>
     <div style="font-size:40px;font-weight:800;color:#0a0a0a;letter-spacing:-.03em;line-height:1;">${escapeHtml(cur)} ${escapeHtml(amt)}</div>
     <div style="display:inline-block;margin-top:14px;font-size:14px;color:#1f9d55;background:#eef7ee;border-radius:20px;padding:6px 14px;">&#127881; Nice work${shop}</div>
-    <p style="font-size:15px;color:#333;line-height:1.5;margin:20px 0 18px;">Hi ${who}, a customer just left you a tip. Open your EasyTipMe app to see your earnings.</p>
+    <p style="font-size:15px;color:#333;line-height:1.5;margin:20px 0 18px;">Hi ${who}, ${lead}. Open your EasyTipMe app to see your earnings.</p>
     <a href="${APP_URL}/staff.html" style="display:inline-block;background:#0071e3;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:13px 26px;border-radius:12px;">Open my tips</a>
   </div>`);
 }
@@ -86,7 +89,7 @@ app.post('/create-payment-intent', async (req, res) => {
 // Send an email to staff when they receive a tip (via Brevo)
 app.post('/notify-tip', async (req, res) => {
   try {
-    const { recipients, amount, currency, shopName } = req.body;
+    const { recipients, amount, currency, shopName, fromName } = req.body;
     const apiKey = process.env.BREVO_API_KEY;
     const senderEmail = process.env.SENDER_EMAIL || 'noreply@easytipme.com';
     const senderName = process.env.SENDER_NAME || 'EasyTipMe';
@@ -99,8 +102,8 @@ app.post('/notify-tip', async (req, res) => {
       const payload = {
         sender: { name: senderName, email: senderEmail },
         to: [{ email: r.email, name: r.name || '' }],
-        subject: 'You received a tip! 🎉',
-        htmlContent: tipEmailHtml(r.name, cur, amt, shopName)
+        subject: (fromName ? (fromName + ' sent you a tip! 🎉') : 'You received a tip! 🎉'),
+        htmlContent: tipEmailHtml(r.name, cur, amt, shopName, fromName)
       };
       try {
         const resp = await fetch('https://api.brevo.com/v3/smtp/email', {

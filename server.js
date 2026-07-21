@@ -339,6 +339,16 @@ app.post('/connect/status', async (req, res) => {
   } catch (e) { console.error('connect status', e.message); res.json({ connected: false, error: e.message }); }
 });
 
+function emailChangedHtml(newEmail, toOld) {
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Your email was ${toOld ? 'changed' : 'updated'}</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 8px;">The email on your EasyTipMe account was ${toOld ? 'changed to' : 'set to'} <b>${escapeHtml(newEmail)}</b>.</p>
+    ${toOld
+      ? `<p style="font-size:13.5px;color:#b23b3b;line-height:1.6;">If you didn't make this change, contact your workplace right away — someone may have access to your account.</p>`
+      : `<p style="font-size:13.5px;color:#6e6e73;line-height:1.6;">You can now sign in with this email. If this wasn't you, contact your workplace.</p>`}
+  </div>`);
+}
+
 // Staff self-service email change: the client changes the Firebase Auth email
 // (after re-auth), then calls this to sync the staff record. We verify the
 // caller's ID token and that they own the record (claimedUid) before updating.
@@ -360,7 +370,22 @@ app.post('/staff/change-email', async (req, res) => {
       if (/already-exists|email-already/i.test(e.message || e.code || '')) return res.status(409).json({ error: 'email-in-use' });
       throw e;
     }
+    const oldEmail = String(snap.data().email || decoded.email || '').toLowerCase();
     await ref.update({ email: addr });
+    // Security notification to BOTH the old and new address that the email changed.
+    try {
+      const apiKey = process.env.BREVO_API_KEY;
+      const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+      const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+      if (apiKey) {
+        const send = (to, subject, html) => fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: to }], subject, htmlContent: html })
+        }).catch(() => {});
+        if (oldEmail && oldEmail !== addr) await send(oldEmail, 'Your EasyTipMe email was changed', emailChangedHtml(addr, true));
+        await send(addr, 'Your EasyTipMe email was updated', emailChangedHtml(addr, false));
+      }
+    } catch (_) {}
     return res.json({ ok: 1 });
   } catch (e) { console.error('change-email', e.message); return res.status(500).json({ error: e.message }); }
 });

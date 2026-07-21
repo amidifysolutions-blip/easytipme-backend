@@ -215,6 +215,69 @@ app.post('/send-verification', async (req, res) => {
   }
 });
 
+// ---- Stripe Connect (staff payouts) — onboarding scaffolding ----
+// Creates an Express connected account for a staff member and returns a Stripe
+// onboarding link so they can add their bank details. Money movement
+// (transfers/instant payouts + tiered fees) is intentionally NOT enabled here
+// yet — that is added AFTER Connect is enabled in the dashboard and tested.
+const adminDb = adminAuth ? require('firebase-admin').firestore() : null;
+
+app.post('/connect/create-account', async (req, res) => {
+  try {
+    const { bid, staffId, email, country } = req.body;
+    if (!bid || !staffId) return res.status(400).json({ error: 'missing bid/staffId' });
+    let accountId = null, ref = null;
+    if (adminDb) {
+      ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+      const snap = await ref.get();
+      accountId = snap.exists && snap.data().connectAccountId;
+    }
+    if (!accountId) {
+      const acct = await stripe.accounts.create({
+        type: 'express',
+        country: (country || 'CA'),
+        email: email || undefined,
+        business_type: 'individual',
+        capabilities: { transfers: { requested: true } },
+        metadata: { bid, staffId }
+      });
+      accountId = acct.id;
+      if (ref) await ref.set({ connectAccountId: accountId, connectStatus: 'created', connectAt: new Date().toISOString() }, { merge: true });
+    }
+    res.json({ accountId });
+  } catch (e) { console.error('connect create', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/connect/onboarding-link', async (req, res) => {
+  try {
+    const { accountId, returnUrl } = req.body;
+    if (!accountId) return res.status(400).json({ error: 'missing accountId' });
+    const base = returnUrl || (APP_URL + '/staff.html');
+    const sep = base.includes('?') ? '&' : '?';
+    const link = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: base + sep + 'connect=refresh',
+      return_url: base + sep + 'connect=done',
+      type: 'account_onboarding'
+    });
+    res.json({ url: link.url });
+  } catch (e) { console.error('connect link', e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post('/connect/status', async (req, res) => {
+  try {
+    const { accountId } = req.body;
+    if (!accountId) return res.json({ connected: false });
+    const acct = await stripe.accounts.retrieve(accountId);
+    res.json({
+      connected: !!acct.payouts_enabled,
+      details_submitted: !!acct.details_submitted,
+      payouts_enabled: !!acct.payouts_enabled,
+      charges_enabled: !!acct.charges_enabled
+    });
+  } catch (e) { console.error('connect status', e.message); res.json({ connected: false, error: e.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

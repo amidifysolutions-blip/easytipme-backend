@@ -143,63 +143,82 @@ app.post('/create-payment-intent', async (req, res) => {
     const tip = Math.round(Number(tipCents));
     if (!(tip > 0)) return res.status(400).json({ error: 'bad-amount' });
 
-    // Station 1: platform commission — a % ADDED ON TOP of the tip. Admin sets
-    // it in the master dashboard (config/platform.commissionPercent).
-    let commPct = 5;
-    try {
-      const cfg = await adminDb.collection('config').doc('platform').get();
-      if (cfg.exists && cfg.data().commissionPercent != null) commPct = Number(cfg.data().commissionPercent);
-    } catch (_) {}
-    if (!(commPct >= 0)) commPct = 5;
-
     const bizSnap = await adminDb.collection('businesses').doc(businessId).get();
     if (!bizSnap.exists) return res.status(404).json({ error: 'shop-not-found' });
     const biz = bizSnap.data();
     if (biz.blocked) return res.status(403).json({ error: 'shop-unavailable' });
     const cur = (currency || biz.currency || 'cad').toLowerCase();
 
-    const stfSnap = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(staffId).get();
-    if (!stfSnap.exists) return res.status(404).json({ error: 'staff-not-found' });
-    const staff = stfSnap.data();
-    // SECURITY: we look the worker's Connect account up server-side from their
-    // staff record — never trust an account id sent by the browser.
-    const workerAcct = staff.connectAccountId;
-    if (!workerAcct) return res.status(409).json({ error: 'recipient-not-ready' });
-
-    // Option (a): only route to a worker whose Connect account can actually
-    // receive. If not ready, reject cleanly so no money is ever mis-held.
-    let acct;
-    try { acct = await stripe.accounts.retrieve(workerAcct); }
-    catch (_) { return res.status(409).json({ error: 'recipient-not-ready' }); }
-    if (!acct.charges_enabled) return res.status(409).json({ error: 'recipient-not-ready' });
+    // Station 1: platform commission — a % ADDED ON TOP of the tip.
+    // Priority: per-shop rate (set in master, businesses/{id}.commissionPercent)
+    //   → global default (config/platform.commissionPercent)
+    //   → 7% fallback.
+    // This lets you charge some shops a higher rate than others.
+    let commPct = null;
+    if (biz.commissionPercent != null && !isNaN(Number(biz.commissionPercent))) {
+      commPct = Number(biz.commissionPercent);
+    } else {
+      try {
+        const cfg = await adminDb.collection('config').doc('platform').get();
+        if (cfg.exists && cfg.data().commissionPercent != null) commPct = Number(cfg.data().commissionPercent);
+      } catch (_) {}
+    }
+    if (commPct == null || !(commPct >= 0)) commPct = 7;
 
     const commission = Math.round(tip * commPct / 100);   // platform keeps this
     const total = tip + commission;                        // customer pays this
 
-    // Destination charge:
-    //  - amount (tip+commission) is charged to the customer's card
-    //  - application_fee_amount (commission) goes to the PLATFORM, in full
-    //  - the remainder (the tip) is transferred to the WORKER's account
-    //  - on_behalf_of = worker → the worker's account is the settlement
-    //    merchant, so Stripe's processing fee is borne by the worker (per your
-    //    decision), leaving the platform commission as clean profit.
+    const stfSnap = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(staffId).get();
+    if (!stfSnap.exists) return res.status(404).json({ error: 'staff-not-found' });
+    const staff = stfSnap.data();
+    // SECURITY: the worker's Connect account is looked up server-side from their
+    // staff record — never trust an account id sent by the browser.
+    const workerAcct = staff.connectAccountId;
+
+    // Is the worker ready to receive money directly?
+    let ready = false;
+    if (workerAcct) {
+      try { const acct = await stripe.accounts.retrieve(workerAcct); ready = !!acct.charges_enabled; }
+      catch (_) { ready = false; }
+    }
+
+    if (ready) {
+      // Direct destination charge — the tip goes straight to the worker, the
+      // commission to the platform. on_behalf_of = worker so the worker's
+      // account is the settlement merchant and bears Stripe's processing fee,
+      // leaving the platform commission as clean profit.
+      const pi = await stripe.paymentIntents.create({
+        amount: total,
+        currency: cur,
+        payment_method_types: ['card'],
+        application_fee_amount: commission,
+        on_behalf_of: workerAcct,
+        transfer_data: { destination: workerAcct },
+        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), held: '0' },
+      });
+      return res.json({
+        clientSecret: pi.client_secret,
+        publishableKey: STRIPE_PUBLISHABLE_KEY,
+        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct },
+        held: false,
+      });
+    }
+
+    // Worker not ready yet → accept the tip, but hold the worker's share safely
+    // (recorded against their staff id) until they finish connecting, then it's
+    // released to them. The platform still keeps its commission. Money is only
+    // ever held for a not-yet-ready worker — never siphoned.
     const pi = await stripe.paymentIntents.create({
       amount: total,
       currency: cur,
       payment_method_types: ['card'],
-      application_fee_amount: commission,
-      on_behalf_of: workerAcct,
-      transfer_data: { destination: workerAcct },
-      metadata: {
-        businessId, staffId,
-        tip: String(tip), commission: String(commission), commissionPercent: String(commPct),
-      },
+      metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), held: '1' },
     });
-
-    res.json({
+    return res.json({
       clientSecret: pi.client_secret,
       publishableKey: STRIPE_PUBLISHABLE_KEY,
       breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct },
+      held: true,
     });
   } catch (error) {
     console.error('create-payment-intent', error.message);

@@ -4,6 +4,10 @@ const cors = require('cors');
 const Stripe = require('stripe');   // ← السطر الثالث ✔
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// Connect endpoints can use a SEPARATE key (e.g. a TEST key) so we can test
+// staff bank onboarding without touching live payments. If unset, falls back
+// to the main (live) key — which is what production will use.
+const connectStripe = process.env.STRIPE_CONNECT_SECRET_KEY ? new Stripe(process.env.STRIPE_CONNECT_SECRET_KEY) : stripe;
 
 // Firebase Admin (optional) — used to generate branded email-verification links
 // that we deliver via Brevo (reliable, on-brand) instead of Firebase's default sender.
@@ -233,7 +237,7 @@ app.post('/connect/create-account', async (req, res) => {
       accountId = snap.exists && snap.data().connectAccountId;
     }
     if (!accountId) {
-      const acct = await stripe.accounts.create({
+      const acct = await connectStripe.accounts.create({
         type: 'express',
         country: (country || 'CA'),
         email: email || undefined,
@@ -254,7 +258,7 @@ app.post('/connect/onboarding-link', async (req, res) => {
     if (!accountId) return res.status(400).json({ error: 'missing accountId' });
     const base = returnUrl || (APP_URL + '/staff.html');
     const sep = base.includes('?') ? '&' : '?';
-    const link = await stripe.accountLinks.create({
+    const link = await connectStripe.accountLinks.create({
       account: accountId,
       refresh_url: base + sep + 'connect=refresh',
       return_url: base + sep + 'connect=done',
@@ -268,7 +272,7 @@ app.post('/connect/status', async (req, res) => {
   try {
     const { accountId } = req.body;
     if (!accountId) return res.json({ connected: false });
-    const acct = await stripe.accounts.retrieve(accountId);
+    const acct = await connectStripe.accounts.retrieve(accountId);
     res.json({
       connected: !!acct.payouts_enabled,
       details_submitted: !!acct.details_submitted,

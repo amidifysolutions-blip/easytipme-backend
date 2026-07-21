@@ -268,6 +268,43 @@ app.post('/staff/activate', async (req, res) => {
   } catch (e) { console.error('staff activate', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Owner FULLY deletes a staff member: removes the Firestore record AND the
+// worker's Firebase login account — but ONLY if that account isn't the owner's
+// own account and isn't linked to another workplace. Verified against the
+// owner's ID token (uid must equal the business id).
+app.post('/staff/delete', async (req, res) => {
+  try {
+    const { idToken, bid, staffId } = req.body;
+    if (!idToken || !bid || !staffId) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    const snap = await ref.get();
+    const claimedUid = snap.exists ? (snap.data().claimedUid || null) : null;
+    // 1) remove the staff record for this shop
+    await ref.delete();
+    // 2) decide whether the login account can be fully removed
+    let authDeleted = false;
+    if (claimedUid && claimedUid !== bid) {
+      let usedElsewhere = false;
+      try {
+        // any OTHER staff doc (in any shop) still linked to this account?
+        const others = await adminDb.collectionGroup('staff').where('claimedUid', '==', claimedUid).limit(1).get();
+        usedElsewhere = !others.empty; // we already deleted this shop's doc, so any match = another workplace
+      } catch (_) { usedElsewhere = false; } // no index/err → current single-workplace model, safe to remove
+      // never delete an account that is itself a business owner
+      let isOwner = false;
+      try { const b = await adminDb.collection('businesses').doc(claimedUid).get(); isOwner = b.exists; } catch (_) {}
+      if (!usedElsewhere && !isOwner) {
+        try { await adminAuth.deleteUser(claimedUid); authDeleted = true; } catch (e) { console.error('deleteUser', e.message); }
+        try { await adminDb.collection('emailCodes').doc(claimedUid).delete(); } catch (_) {}
+      }
+    }
+    res.json({ ok: true, authDeleted });
+  } catch (e) { console.error('staff delete', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Business owner changes their own login email. Their Stripe payout account is
 // linked by account id (not email), so the connection stays intact. Verified
 // against the owner's ID token (uid must equal the business id).

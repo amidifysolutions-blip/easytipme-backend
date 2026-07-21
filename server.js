@@ -327,6 +327,25 @@ app.post('/connect/status', async (req, res) => {
   } catch (e) { console.error('connect status', e.message); res.json({ connected: false, error: e.message }); }
 });
 
+// Staff self-service email change: the client changes the Firebase Auth email
+// (after re-auth), then calls this to sync the staff record. We verify the
+// caller's ID token and that they own the record (claimedUid) before updating.
+app.post('/staff/change-email', async (req, res) => {
+  try {
+    const { idToken, bid, staffId, newEmail } = req.body;
+    if (!idToken || !bid || !staffId || !newEmail) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'staff-not-found' });
+    if (snap.data().claimedUid !== uid) return res.status(403).json({ error: 'not-your-record' });
+    await ref.update({ email: String(newEmail).toLowerCase() });
+    return res.json({ ok: 1 });
+  } catch (e) { console.error('change-email', e.message); return res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

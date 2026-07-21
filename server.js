@@ -219,6 +219,51 @@ app.post('/send-verification', async (req, res) => {
   }
 });
 
+function resetEmailHtml(name, link) {
+  const who = escapeHtml(name || 'there');
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Reset your password</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 6px;">Hi ${who}, we received a request to reset your EasyTipMe password. Tap below to choose a new one.</p>
+    <a href="${link}" style="display:inline-block;margin-top:12px;background:#0071e3;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:13px 26px;border-radius:12px;">Reset my password</a>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:20px 0 0;">If you didn't request this, you can safely ignore this email — your password won't change.</p>
+  </div>`);
+}
+
+// Generate a Firebase password-reset link and deliver it via Brevo (branded, not spammy)
+app.post('/send-reset', async (req, res) => {
+  try {
+    const { email, name, continueUrl } = req.body;
+    if (!email) return res.json({ sent: 0, note: 'no email' });
+    if (!adminAuth) return res.json({ sent: 0, note: 'admin-not-configured' });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
+    const addr = String(email).toLowerCase();
+    let link;
+    try {
+      link = await adminAuth.generatePasswordResetLink(addr, continueUrl ? { url: continueUrl } : undefined);
+    } catch (e) {
+      link = await adminAuth.generatePasswordResetLink(addr);
+    }
+    const payload = {
+      sender: { name: senderName, email: senderEmail },
+      to: [{ email: addr, name: name || '' }],
+      subject: 'Reset your EasyTipMe password',
+      htmlContent: resetEmailHtml(name, link)
+    };
+    const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    return res.json({ sent: resp.ok ? 1 : 0 });
+  } catch (error) {
+    console.error('send-reset error', error.message);
+    return res.json({ sent: 0, error: error.message });
+  }
+});
+
 // ---- Stripe Connect (staff payouts) — onboarding scaffolding ----
 // Creates an Express connected account for a staff member and returns a Stripe
 // onboarding link so they can add their bank details. Money movement

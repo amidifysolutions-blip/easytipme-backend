@@ -339,6 +339,45 @@ app.post('/connect/status', async (req, res) => {
   } catch (e) { console.error('connect status', e.message); res.json({ connected: false, error: e.message }); }
 });
 
+// Real Stripe balance + recent payouts for a connected account.
+// Stripe is the single source of truth for money — the dashboards show THESE
+// numbers, never our own tallies, so a worker never sees two different amounts.
+app.post('/connect/balance', async (req, res) => {
+  try {
+    const { accountId } = req.body;
+    if (!accountId) return res.status(400).json({ error: 'missing accountId' });
+    const hdr = { stripeAccount: accountId };
+    const bal = await connectStripe.balance.retrieve(hdr);
+    const sum = (arr) => (arr || []).reduce((t, b) => t + (b.amount || 0), 0);
+    const pick = (arr) => {
+      // group by currency; return the largest bucket's currency as the primary
+      const m = {}; (arr || []).forEach(b => { m[b.currency] = (m[b.currency] || 0) + b.amount; });
+      const cur = Object.keys(m).sort((a, c) => m[c] - m[a])[0] || 'cad';
+      return cur;
+    };
+    const currency = pick(bal.available.length ? bal.available : bal.pending) || 'cad';
+    const avail = sum(bal.available.filter(b => b.currency === currency));
+    const pend = sum(bal.pending.filter(b => b.currency === currency));
+    const instant = sum((bal.instant_available || []).filter(b => b.currency === currency));
+    let payouts = [];
+    try {
+      const pl = await connectStripe.payouts.list({ limit: 8 }, hdr);
+      payouts = pl.data.map(p => ({
+        amount: p.amount / 100, currency: p.currency, status: p.status,
+        method: p.method, arrival_date: p.arrival_date, created: p.created,
+        auto: p.automatic === true
+      }));
+    } catch (_) {}
+    res.json({
+      currency,
+      available: avail / 100,
+      pending: pend / 100,
+      instantAvailable: instant / 100,
+      payouts
+    });
+  } catch (e) { console.error('connect balance', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Owner (business) connects THEIR OWN payout account — destination for their
 // admin fee (and, in the collect model, the whole pool). Verified against the
 // owner's ID token (uid must equal the business id).

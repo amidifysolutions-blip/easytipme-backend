@@ -5,6 +5,22 @@ const Stripe = require('stripe');   // ← السطر الثالث ✔
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// Firebase Admin (optional) — used to generate branded email-verification links
+// that we deliver via Brevo (reliable, on-brand) instead of Firebase's default sender.
+let adminAuth = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const admin = require('firebase-admin');
+    const svc = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    if (svc.private_key && svc.private_key.includes('\\n')) svc.private_key = svc.private_key.replace(/\\n/g, '\n');
+    if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(svc) });
+    adminAuth = admin.auth();
+    console.log('Firebase Admin initialized.');
+  } else {
+    console.log('FIREBASE_SERVICE_ACCOUNT not set — /send-verification disabled.');
+  }
+} catch (e) { console.error('Firebase Admin init failed:', e.message); }
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -150,6 +166,52 @@ app.post('/notify-welcome', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+function verifyEmailHtml(name, link) {
+  const who = escapeHtml(name || 'there');
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Confirm your email</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 6px;">Hi ${who}, tap below to confirm your email and activate your EasyTipMe account.</p>
+    <a href="${link}" style="display:inline-block;margin-top:12px;background:#0071e3;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:13px 26px;border-radius:12px;">Confirm my email</a>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:20px 0 0;">This link is valid for a limited time. If it expires, just request a new one from the app. If you didn't sign up, you can ignore this email.</p>
+  </div>`);
+}
+
+// Generate a Firebase email-verification link and deliver it via Brevo (branded, reliable)
+app.post('/send-verification', async (req, res) => {
+  try {
+    const { email, name, continueUrl } = req.body;
+    if (!email) return res.json({ sent: 0, note: 'no email' });
+    if (!adminAuth) return res.json({ sent: 0, note: 'admin-not-configured' });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'noreply@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
+    const addr = String(email).toLowerCase();
+    let link;
+    try {
+      link = await adminAuth.generateEmailVerificationLink(addr, continueUrl ? { url: continueUrl, handleCodeInApp: false } : undefined);
+    } catch (e) {
+      // e.g. continueUrl domain not authorized — retry with Firebase's default handler
+      link = await adminAuth.generateEmailVerificationLink(addr);
+    }
+    const payload = {
+      sender: { name: senderName, email: senderEmail },
+      to: [{ email: addr, name: name || '' }],
+      subject: 'Confirm your EasyTipMe email',
+      htmlContent: verifyEmailHtml(name, link)
+    };
+    const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    return res.json({ sent: resp.ok ? 1 : 0 });
+  } catch (error) {
+    console.error('send-verification error', error.message);
+    return res.json({ sent: 0, error: error.message });
   }
 });
 

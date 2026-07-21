@@ -341,7 +341,14 @@ app.post('/staff/change-email', async (req, res) => {
     const snap = await ref.get();
     if (!snap.exists) return res.status(404).json({ error: 'staff-not-found' });
     if (snap.data().claimedUid !== uid) return res.status(403).json({ error: 'not-your-record' });
-    await ref.update({ email: String(newEmail).toLowerCase() });
+    const addr = String(newEmail).toLowerCase();
+    try {
+      await adminAuth.updateUser(uid, { email: addr, emailVerified: false });
+    } catch (e) {
+      if (/already-exists|email-already/i.test(e.message || e.code || '')) return res.status(409).json({ error: 'email-in-use' });
+      throw e;
+    }
+    await ref.update({ email: addr });
     return res.json({ ok: 1 });
   } catch (e) { console.error('change-email', e.message); return res.status(500).json({ error: e.message }); }
 });

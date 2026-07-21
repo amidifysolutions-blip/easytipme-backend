@@ -111,7 +111,7 @@ app.post('/notify-tip', async (req, res) => {
   try {
     const { recipients, amount, currency, shopName, fromName } = req.body;
     const apiKey = process.env.BREVO_API_KEY;
-    const senderEmail = process.env.SENDER_EMAIL || 'noreply@easytipme.com';
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
     const senderName = process.env.SENDER_NAME || 'EasyTipMe';
     if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
     const list = (recipients || []).filter(r => r && r.email);
@@ -146,7 +146,7 @@ app.post('/notify-welcome', async (req, res) => {
   try {
     const { email, name, shopName, staffLink } = req.body;
     const apiKey = process.env.BREVO_API_KEY;
-    const senderEmail = process.env.SENDER_EMAIL || 'noreply@easytipme.com';
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
     const senderName = process.env.SENDER_NAME || 'EasyTipMe';
     if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
     if (!email) return res.json({ sent: 0, note: 'no email' });
@@ -190,7 +190,7 @@ app.post('/send-verification', async (req, res) => {
     if (!email) return res.json({ sent: 0, note: 'no email' });
     if (!adminAuth) return res.json({ sent: 0, note: 'admin-not-configured' });
     const apiKey = process.env.BREVO_API_KEY;
-    const senderEmail = process.env.SENDER_EMAIL || 'noreply@easytipme.com';
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
     const senderName = process.env.SENDER_NAME || 'EasyTipMe';
     if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
     const addr = String(email).toLowerCase();

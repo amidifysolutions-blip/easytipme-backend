@@ -184,7 +184,7 @@ app.post('/notify-welcome', async (req, res) => {
     if (!email) return res.json({ sent: 0, note: 'no email' });
     const payload = {
       sender: { name: senderName, email: senderEmail },
-      to: [{ email, name: name || '' }],
+      to: [{ email, name: name || undefined }],
       subject: `${shopName ? shopName + ' invited you to ' : 'Welcome to '}EasyTipMe 🎉`,
       htmlContent: welcomeEmailHtml(name, shopName, staffLink)
     };
@@ -243,7 +243,7 @@ app.post('/staff/invite', async (req, res) => {
         const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
           method: 'POST',
           headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
-          body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || '' }], subject, htmlContent: html })
+          body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || undefined }], subject, htmlContent: html })
         });
         sent = resp.ok ? 1 : 0;
       } catch (e) { console.error('invite email', e.message); }
@@ -377,7 +377,7 @@ app.post('/send-code', async (req, res) => {
     if (apiKey) {
       const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
-        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || '' }], subject: 'Your EasyTipMe confirmation code', htmlContent: emailCodeHtml(name, code) })
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || undefined }], subject: 'Your EasyTipMe confirmation code', htmlContent: emailCodeHtml(name, code) })
       });
       sent = resp.ok ? 1 : 0;
       if (!resp.ok) {
@@ -441,7 +441,7 @@ app.post('/send-verification', async (req, res) => {
     }
     const payload = {
       sender: { name: senderName, email: senderEmail },
-      to: [{ email: addr, name: name || '' }],
+      to: [{ email: addr, name: name || undefined }],
       subject: 'Confirm your EasyTipMe email',
       htmlContent: verifyEmailHtml(name, link)
     };
@@ -486,7 +486,7 @@ app.post('/send-reset', async (req, res) => {
     }
     const payload = {
       sender: { name: senderName, email: senderEmail },
-      to: [{ email: addr, name: name || '' }],
+      to: [{ email: addr, name: name || undefined }],
       subject: 'Reset your EasyTipMe password',
       htmlContent: resetEmailHtml(name, link)
     };

@@ -268,6 +268,41 @@ app.post('/staff/activate', async (req, res) => {
   } catch (e) { console.error('staff activate', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Business owner changes their own login email. Their Stripe payout account is
+// linked by account id (not email), so the connection stays intact. Verified
+// against the owner's ID token (uid must equal the business id).
+app.post('/owner/change-email', async (req, res) => {
+  try {
+    const { idToken, bid, newEmail } = req.body;
+    if (!idToken || !bid || !newEmail) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    const addr = String(newEmail).toLowerCase();
+    const oldEmail = String(decoded.email || '').toLowerCase();
+    try {
+      await adminAuth.updateUser(bid, { email: addr, emailVerified: false });
+    } catch (e) {
+      if (/already-exists|email-already/i.test(e.message || e.code || '')) return res.status(409).json({ error: 'email-in-use' });
+      throw e;
+    }
+    try { await adminDb.collection('businesses').doc(bid).update({ email: addr }); } catch (_) {}
+    // Security notifications to BOTH the old and new address.
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (apiKey) {
+      const send = (to, toOld) => fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: to }], subject: 'Your EasyTipMe email was changed', htmlContent: emailChangedHtml(addr, toOld) })
+      }).catch(() => {});
+      if (oldEmail && oldEmail !== addr) await send(oldEmail, true);
+      await send(addr, false);
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('owner change-email', e.message); res.status(500).json({ error: e.message }); }
+});
+
 function verifyEmailHtml(name, link) {
   const who = escapeHtml(name || 'there');
   return emailShell(`<div style="text-align:center">

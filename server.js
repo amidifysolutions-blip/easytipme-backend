@@ -273,7 +273,7 @@ const adminDb = adminAuth ? require('firebase-admin').firestore() : null;
 
 app.post('/connect/create-account', async (req, res) => {
   try {
-    const { bid, staffId, email, country } = req.body;
+    const { bid, staffId, email, country, firstName, lastName, phone } = req.body;
     if (!bid || !staffId) return res.status(400).json({ error: 'missing bid/staffId' });
     let accountId = null, ref = null;
     if (adminDb) {
@@ -282,11 +282,23 @@ app.post('/connect/create-account', async (req, res) => {
       accountId = snap.exists && snap.data().connectAccountId;
     }
     if (!accountId) {
+      // Pre-fill what we know so the staff member skips the business/industry questions —
+      // they're an individual receiving tips, not a merchant setting up a store.
+      const individual = {};
+      if (email) individual.email = email;
+      if (firstName) individual.first_name = String(firstName).slice(0, 40);
+      if (lastName) individual.last_name = String(lastName).slice(0, 40);
+      let ph = String(phone || '').replace(/[^\d+]/g, '');
+      if (ph && !ph.startsWith('+')) { ph = ph.length === 10 ? '+1' + ph : ''; }
+      if (ph) individual.phone = ph;
       const acct = await connectStripe.accounts.create({
         type: 'express',
         country: (country || 'CA'),
         email: email || undefined,
         business_type: 'individual',
+        // Pre-set the category & description so Stripe doesn't ask the worker "select your industry".
+        business_profile: { mcc: '7299', product_description: 'Tips and gratuities received through EasyTipMe.' },
+        individual: Object.keys(individual).length ? individual : undefined,
         capabilities: { transfers: { requested: true } },
         metadata: { bid, staffId }
       });

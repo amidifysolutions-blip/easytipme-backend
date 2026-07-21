@@ -303,6 +303,70 @@ app.post('/owner/change-email', async (req, res) => {
   } catch (e) { console.error('owner change-email', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ---- Our own email verification via a 6-digit code (Brevo) ----
+// Bypasses Firebase's generateEmailVerificationLink, which gets rate-limited
+// (TOO_MANY_ATTEMPTS) under heavy use. We store the code, email it via Brevo,
+// and on match set emailVerified=true ourselves (updateUser is not throttled).
+function emailCodeHtml(name, code) {
+  const who = escapeHtml(name || 'there');
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Confirm your email</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 10px;">Hi ${who}, enter this code in the app to confirm your email:</p>
+    <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#0071e3;background:#f2f7ff;border-radius:14px;padding:16px 0;margin:0 0 10px;">${escapeHtml(code)}</div>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:10px 0 0;">This code expires in 15 minutes. If you didn't request it, you can ignore this email.</p>
+  </div>`);
+}
+app.post('/send-code', async (req, res) => {
+  try {
+    const { idToken, name } = req.body;
+    if (!idToken) return res.status(400).json({ sent: 0, error: 'missing idToken' });
+    if (!adminAuth || !adminDb) return res.json({ sent: 0, error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const addr = String(decoded.email || '').toLowerCase();
+    if (!addr) return res.json({ sent: 0, error: 'no-email' });
+    const ref = adminDb.collection('emailCodes').doc(uid);
+    const now = Date.now();
+    const cur = await ref.get();
+    if (cur.exists && cur.data().lastSentMs && (now - cur.data().lastSentMs) < 25000) {
+      return res.json({ sent: 0, error: 'slow-down' });
+    }
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await ref.set({ code, email: addr, expMs: now + 15 * 60000, tries: 0, lastSentMs: now });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    let sent = 0;
+    if (apiKey) {
+      const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr, name: name || '' }], subject: 'Your EasyTipMe confirmation code', htmlContent: emailCodeHtml(name, code) })
+      });
+      sent = resp.ok ? 1 : 0;
+    }
+    res.json({ sent });
+  } catch (e) { console.error('send-code', e.message); res.json({ sent: 0, error: e.message }); }
+});
+app.post('/verify-code', async (req, res) => {
+  try {
+    const { idToken, code } = req.body;
+    if (!idToken || !code) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const ref = adminDb.collection('emailCodes').doc(uid);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(400).json({ error: 'no-code' });
+    const d = snap.data();
+    if (Date.now() > d.expMs) { await ref.delete(); return res.status(400).json({ error: 'expired' }); }
+    if ((d.tries || 0) >= 5) return res.status(429).json({ error: 'too-many' });
+    if (String(code).trim() !== String(d.code)) { await ref.update({ tries: (d.tries || 0) + 1 }); return res.status(400).json({ error: 'wrong-code' }); }
+    await adminAuth.updateUser(uid, { emailVerified: true });
+    await ref.delete();
+    res.json({ ok: true });
+  } catch (e) { console.error('verify-code', e.message); res.status(500).json({ error: e.message }); }
+});
+
 function verifyEmailHtml(name, link) {
   const who = escapeHtml(name || 'there');
   return emailShell(`<div style="text-align:center">

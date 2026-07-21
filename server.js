@@ -339,6 +339,35 @@ app.post('/connect/status', async (req, res) => {
   } catch (e) { console.error('connect status', e.message); res.json({ connected: false, error: e.message }); }
 });
 
+// Owner (business) connects THEIR OWN payout account — destination for their
+// admin fee (and, in the collect model, the whole pool). Verified against the
+// owner's ID token (uid must equal the business id).
+app.post('/connect/create-owner-account', async (req, res) => {
+  try {
+    const { idToken, bid, email, country } = req.body;
+    if (!idToken || !bid) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    const ref = adminDb.collection('businesses').doc(bid);
+    const snap = await ref.get();
+    let accountId = snap.exists && snap.data().ownerConnectAccountId;
+    if (!accountId) {
+      const acct = await connectStripe.accounts.create({
+        type: 'express',
+        country: (country || 'CA'),
+        email: email || decoded.email || undefined,
+        business_profile: { mcc: '7299', product_description: 'Tips and administrative fees collected through EasyTipMe.' },
+        capabilities: { transfers: { requested: true } },
+        metadata: { bid, role: 'owner' }
+      });
+      accountId = acct.id;
+      await ref.set({ ownerConnectAccountId: accountId, ownerConnectStatus: 'created', ownerConnectAt: new Date().toISOString() }, { merge: true });
+    }
+    res.json({ accountId });
+  } catch (e) { console.error('connect owner create', e.message); res.status(500).json({ error: e.message }); }
+});
+
 function emailChangedHtml(newEmail, toOld) {
   return emailShell(`<div style="text-align:center">
     <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Your email was ${toOld ? 'changed' : 'updated'}</div>

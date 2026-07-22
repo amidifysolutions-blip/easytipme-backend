@@ -911,12 +911,15 @@ app.post('/notify-tip', async (req, res) => {
     const cur = (currency || '').toUpperCase();
     let sent = 0;
     for (const r of list) {
+      // "Who tipped me" (the payer's name) is a Worker Pro feature — only reveal
+      // the tipper's name to Pro workers. Free workers get a neutral notification.
+      const showFrom = r.pro === true ? fromName : '';
       const payload = {
         sender: { name: senderName, email: senderEmail },
         // name must be omitted (undefined) when empty — Brevo rejects an empty string.
         to: [{ email: r.email, name: r.name || undefined }],
-        subject: (fromName ? (fromName + ' sent you a tip! 🎉') : 'You received a tip! 🎉'),
-        htmlContent: tipEmailHtml(r.name, cur, amt, shopName, fromName)
+        subject: (showFrom ? (showFrom + ' sent you a tip! 🎉') : 'You received a tip! 🎉'),
+        htmlContent: tipEmailHtml(r.name, cur, amt, shopName, showFrom)
       };
       try {
         const resp = await fetch('https://api.brevo.com/v3/smtp/email', {

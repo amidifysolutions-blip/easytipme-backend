@@ -201,24 +201,28 @@ app.post('/create-payment-intent', async (req, res) => {
       // (No on_behalf_of — that would require the worker to have `card_payments`.)
 
       // --- Monthly active-account fee ($2) ---------------------------------
-      // Taken at most once per 30 days, only when the worker has MORE than 5
-      // tips in the last 30 days (active), and only from a tip >= $3 (so the
-      // worker still nets from it). Deducted from the worker's transfer — the
-      // customer's total is unchanged. If the 6th tip is too small, we wait for
-      // the next tip >= $3 in the cycle.
+      // Fair, VOLUME-based: taken at most once per 30 days, and only once the
+      // worker has EARNED more than $20 in tips in the last 30 days (this tip
+      // included). Only deducted from a tip >= $3 so the worker still nets from
+      // it — if the tip that crosses $20 is smaller, we wait for the next tip
+      // >= $3 in the cycle. Deducted from the worker's transfer; the customer's
+      // total is unchanged.
+      const FEE_CENTS = 200;            // $2 monthly fee
+      const FEE_MIN_EARNED = 2000;      // only after > $20 earned in the cycle
+      const FEE_MIN_TIP = 300;          // only deduct from a tip >= $3
       let monthlyFeeCents = 0;
       try {
         const now = Date.now();
         const WINDOW = 30 * 24 * 60 * 60 * 1000;
         const lastMs = staff.lastFeeTakenAt ? Date.parse(staff.lastFeeTakenAt) : 0;
         const feeRecently = lastMs && (now - lastMs) < WINDOW;   // already charged this cycle
-        if (!feeRecently && tip >= 300) {
+        if (!feeRecently && tip >= FEE_MIN_TIP) {
           const winStart = now - WINDOW;
           const tipsSnap = await adminDb.collection('businesses').doc(businessId).collection('tips').where('staffId', '==', staffId).get();
-          let cnt = 0;
-          tipsSnap.forEach(d => { const x = d.data(); const ms = (x.createdAt && x.createdAt.toMillis) ? x.createdAt.toMillis() : 0; if (ms >= winStart) cnt++; });
-          if (cnt >= 5) {   // this incoming tip is the 6th+ within 30 days
-            monthlyFeeCents = 200;
+          let earnedCents = tip;   // include the tip being paid now
+          tipsSnap.forEach(d => { const x = d.data(); const ms = (x.createdAt && x.createdAt.toMillis) ? x.createdAt.toMillis() : 0; if (ms >= winStart) earnedCents += Math.round(Number(x.tip || 0) * 100); });
+          if (earnedCents > FEE_MIN_EARNED) {   // earned more than $20 this cycle
+            monthlyFeeCents = FEE_CENTS;
             // Mark now (optimistic) so a second tip can't double-charge the cycle.
             try { await stfSnap.ref.update({ lastFeeTakenAt: new Date().toISOString() }); } catch (_) {}
           }

@@ -779,6 +779,52 @@ app.post('/settle-owner-fee', async (req, res) => {
   } catch (e) { console.error('settle-owner-fee', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Keep a worker's staff records in sync with their real login email. If the
+// worker signed in (or changed their login) with an email that differs from the
+// email on their staff record, future tips would be addressed to the old email
+// and never reach them. Called by the worker app on load. Also back-fills the
+// worker's own recent tips so already-received tips become visible immediately.
+app.post('/staff/sync-email', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const email = (decoded.email || '').toLowerCase();
+    if (!email) return res.json({ ok: true, changed: 0 });
+    let changed = 0, tipsFixed = 0;
+    const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
+    for (const d of g.docs) {
+      const s = d.data();
+      const old = (s.email || '').toLowerCase();
+      if (old === email) continue;
+      // point the staff record at the real login email
+      await d.ref.set({ email }, { merge: true });
+      changed++;
+      // back-fill recent tips (last 60 days) addressed to the old email so the
+      // worker can see tips they already received under the old address
+      try {
+        const bizRef = d.ref.parent.parent; // businesses/{bid}
+        const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+        const ts = await bizRef.collection('tips').where('recipientEmails', 'array-contains', old).get();
+        let batch = adminDb.batch(), n = 0;
+        for (const td of ts.docs) {
+          const arr = (td.data().recipientEmails || []).map(x => String(x).toLowerCase());
+          if (arr.includes(email)) continue;
+          const ca = td.data().createdAt;
+          if (ca && ca.toDate && ca.toDate() < cutoff) continue;
+          arr.push(email);
+          batch.set(td.ref, { recipientEmails: arr }, { merge: true });
+          tipsFixed++;
+          if (++n >= 400) { await batch.commit(); batch = adminDb.batch(); n = 0; }
+        }
+        if (n > 0) await batch.commit();
+      } catch (e) { console.error('sync-email backfill', e.message); }
+    }
+    res.json({ ok: true, changed, tipsFixed });
+  } catch (e) { console.error('sync-email', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Contact / support form → emails the support inbox (reply-to the sender).
 app.post('/contact', async (req, res) => {
   try {

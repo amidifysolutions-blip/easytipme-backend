@@ -199,17 +199,44 @@ app.post('/create-payment-intent', async (req, res) => {
       // We set transfer_data.amount explicitly (instead of application_fee_amount)
       // so the worker's account shows a clean $50 — not "$53.50 minus a fee".
       // (No on_behalf_of — that would require the worker to have `card_payments`.)
+
+      // --- Monthly active-account fee ($2) ---------------------------------
+      // Taken at most once per 30 days, only when the worker has MORE than 5
+      // tips in the last 30 days (active), and only from a tip >= $3 (so the
+      // worker still nets from it). Deducted from the worker's transfer — the
+      // customer's total is unchanged. If the 6th tip is too small, we wait for
+      // the next tip >= $3 in the cycle.
+      let monthlyFeeCents = 0;
+      try {
+        const now = Date.now();
+        const WINDOW = 30 * 24 * 60 * 60 * 1000;
+        const lastMs = staff.lastFeeTakenAt ? Date.parse(staff.lastFeeTakenAt) : 0;
+        const feeRecently = lastMs && (now - lastMs) < WINDOW;   // already charged this cycle
+        if (!feeRecently && tip >= 300) {
+          const winStart = now - WINDOW;
+          const tipsSnap = await adminDb.collection('businesses').doc(businessId).collection('tips').where('staffId', '==', staffId).get();
+          let cnt = 0;
+          tipsSnap.forEach(d => { const x = d.data(); const ms = (x.createdAt && x.createdAt.toMillis) ? x.createdAt.toMillis() : 0; if (ms >= winStart) cnt++; });
+          if (cnt >= 5) {   // this incoming tip is the 6th+ within 30 days
+            monthlyFeeCents = 200;
+            // Mark now (optimistic) so a second tip can't double-charge the cycle.
+            try { await stfSnap.ref.update({ lastFeeTakenAt: new Date().toISOString() }); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      const workerTransfer = tip - monthlyFeeCents;
+
       const pi = await stripe.paymentIntents.create({
         amount: total,
         currency: cur,
         payment_method_types: ['card'],
-        transfer_data: { destination: workerAcct, amount: tip },
-        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), held: '0' },
+        transfer_data: { destination: workerAcct, amount: workerTransfer },
+        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), monthlyFee: String(monthlyFeeCents), held: '0' },
       });
       return res.json({
         clientSecret: pi.client_secret,
         publishableKey: STRIPE_PUBLISHABLE_KEY,
-        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed },
+        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed, monthlyFee: monthlyFeeCents },
         held: false,
       });
     }

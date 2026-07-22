@@ -298,7 +298,7 @@ app.get('/stripe-config', (req, res) => {
 const STRIPE_IS_LIVE = String(process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live');
 const PLAN_INFO = {
   owner:       { keyBase: 'ownerPrice',       amount: 1999, name: 'EasyTipMe Pro' },
-  worker:      { keyBase: 'workerPrice',      amount: 499,  name: 'EasyTipMe Pro — Worker' },
+  worker:      { keyBase: 'workerPrice',      amount: 499,  name: 'EasyTipMe Pro' },
   business:    { keyBase: 'businessPrice',    amount: 4999, name: 'EasyTipMe Business — up to 10 locations' },
   businesspro: { keyBase: 'businessProPrice', amount: 9999, name: 'EasyTipMe Business Pro — up to 25 locations' }
 };

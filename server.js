@@ -175,24 +175,32 @@ app.post('/create-payment-intent', async (req, res) => {
     // staff record — never trust an account id sent by the browser.
     const workerAcct = staff.connectAccountId;
 
-    // Is the worker ready to receive money directly?
+    // Is the worker ready to RECEIVE money directly? For a destination charge the
+    // recipient needs the `transfers` capability active (they only receive — they
+    // are not a card-processing merchant, so charges_enabled may be false).
     let ready = false;
     if (workerAcct) {
-      try { const acct = await stripe.accounts.retrieve(workerAcct); ready = !!acct.charges_enabled; }
-      catch (_) { ready = false; }
+      try {
+        const acct = await stripe.accounts.retrieve(workerAcct);
+        const transfersActive = acct.capabilities && acct.capabilities.transfers === 'active';
+        ready = !!(transfersActive || acct.payouts_enabled);
+      } catch (_) { ready = false; }
     }
 
     if (ready) {
-      // Direct destination charge — the tip goes straight to the worker, the
-      // commission to the platform. on_behalf_of = worker so the worker's
-      // account is the settlement merchant and bears Stripe's processing fee,
-      // leaving the platform commission as clean profit.
+      // Direct destination charge (standard tipping-platform model): the platform
+      // is the merchant of record, the worker only needs the `transfers`
+      // capability (which they have) to RECEIVE. The tip goes straight to the
+      // worker (amount − application_fee), the commission (application_fee) stays
+      // with the platform, and Stripe's processing fee comes out of the platform's
+      // commission. The worker keeps 100% of the tip.
+      // (We do NOT use on_behalf_of — that requires the worker to have the
+      //  `card_payments` capability, i.e. be a card-processing merchant.)
       const pi = await stripe.paymentIntents.create({
         amount: total,
         currency: cur,
         payment_method_types: ['card'],
         application_fee_amount: commission,
-        on_behalf_of: workerAcct,
         transfer_data: { destination: workerAcct },
         metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), held: '0' },
       });
@@ -769,9 +777,9 @@ app.post('/staff/release-held', async (req, res) => {
       const staff = sd.data();
       const acctId = staff.connectAccountId;
       if (!acctId) continue;
-      // Must actually be able to receive before we move money.
+      // Must actually be able to receive (transfers capability) before we move money.
       let ok = false;
-      try { const a = await stripe.accounts.retrieve(acctId); ok = !!a.charges_enabled; } catch (_) { ok = false; }
+      try { const a = await stripe.accounts.retrieve(acctId); ok = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled); } catch (_) { ok = false; }
       if (!ok) continue;
       const bizRef = sd.ref.parent.parent;   // businesses/{bid}
       if (!bizRef) continue;

@@ -414,13 +414,30 @@ app.post('/billing/cancel', async (req, res) => {
     if (!idToken) return res.status(400).json({ error: 'missing-fields' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     if (plan === 'worker') {
-      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
-      let subId = '';
-      g.forEach(d => { if (!subId && d.data().workerProSubId) subId = d.data().workerProSubId; });
-      if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
-      const batch = adminDb.batch();
-      g.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }));
-      await batch.commit();
+      const { bid, staffId } = req.body;
+      const email = (decoded.email || '').toLowerCase();
+      let subId = '', handled = false;
+      // Preferred path: the app knows its own bid+staffId → cancel directly (no
+      // collection-group index needed). Verify ownership first.
+      if (bid && staffId) {
+        const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+        const s = await ref.get();
+        if (s.exists && (s.data().claimedUid === decoded.uid || (s.data().email || '').toLowerCase() === email)) {
+          subId = s.data().workerProSubId || '';
+          if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+          await ref.set({ workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true });
+          handled = true;
+        }
+      }
+      // Fallback: locate the worker's staff records via collection group.
+      if (!handled) {
+        const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
+        g.forEach(d => { if (!subId && d.data().workerProSubId) subId = d.data().workerProSubId; });
+        if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+        const batch = adminDb.batch();
+        g.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }));
+        await batch.commit();
+      }
     } else if (plan === 'businesspro') {
       const ref = adminDb.collection('businesses').doc(decoded.uid);
       const snap = await ref.get();
@@ -787,14 +804,24 @@ app.post('/settle-owner-fee', async (req, res) => {
 app.post('/staff/sync-email', async (req, res) => {
   try {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
-    const { idToken } = req.body || {};
+    const { idToken, bid, staffId } = req.body || {};
     if (!idToken) return res.status(400).json({ error: 'missing-fields' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     const email = (decoded.email || '').toLowerCase();
     if (!email) return res.json({ ok: true, changed: 0 });
     let changed = 0, tipsFixed = 0;
-    const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
-    for (const d of g.docs) {
+    // Prefer the direct staff-doc reference (the app knows bid+staffId) to avoid a
+    // collection-group index dependency; fall back to collection group otherwise.
+    let docs = [];
+    if (bid && staffId) {
+      const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+      const s = await ref.get();
+      if (s.exists && (s.data().claimedUid === decoded.uid || (s.data().email || '').toLowerCase() === email)) docs = [s];
+    }
+    if (!docs.length) {
+      try { const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get(); docs = g.docs; } catch (e) { console.error('sync-email cg', e.message); }
+    }
+    for (const d of docs) {
       const s = d.data();
       const old = (s.email || '').toLowerCase();
       if (old === email) continue;

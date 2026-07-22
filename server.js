@@ -394,16 +394,74 @@ app.post('/billing/cancel', async (req, res) => {
 // Removes the business doc, its staff/tips/consents, its shop code, cancels any
 // Pro subscription, and deletes the owner's Firebase login. Workers' own accounts
 // and bank connections are NOT touched (they may belong to other shops).
+// Step 1: request a 6-digit deletion code, emailed to the owner's own address.
+function deleteCodeHtml(code) {
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Confirm account deletion</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 10px;">You asked to permanently delete your EasyTipMe business account. Enter this code in the app to confirm:</p>
+    <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#e5484d;background:#fff2f2;border-radius:14px;padding:16px 0;margin:0 0 10px;">${escapeHtml(code)}</div>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:10px 0 0;">This code expires in 15 minutes. If you didn't request this, ignore this email — your account stays exactly as it is.</p>
+  </div>`);
+}
+app.post('/business/delete-request', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.json({ sent: 0, error: 'admin-not-configured' });
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ sent: 0, error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const addr = decoded.email || '';
+    if (!addr) return res.status(400).json({ sent: 0, error: 'no-email' });
+    const ref = adminDb.collection('deleteCodes').doc(uid);
+    const now = Date.now();
+    const cur = await ref.get();
+    if (cur.exists && cur.data().lastSentMs && (now - cur.data().lastSentMs) < 25000) return res.json({ sent: 1 });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await ref.set({ code, email: addr, expMs: now + 15 * 60000, tries: 0, lastSentMs: now });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (apiKey) {
+      await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr }], subject: 'Your EasyTipMe account deletion code', htmlContent: deleteCodeHtml(code) })
+      });
+    }
+    res.json({ sent: 1 });
+  } catch (e) { console.error('business delete-request', e.message); res.json({ sent: 0, error: e.message }); }
+});
+
 app.post('/business/delete', async (req, res) => {
   try {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
-    const { idToken } = req.body;
-    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const { idToken, code } = req.body;
+    if (!idToken || !code) return res.status(400).json({ error: 'missing-fields' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     const uid = decoded.uid;
+    // Verify the emailed deletion code before doing anything destructive.
+    const codeRef = adminDb.collection('deleteCodes').doc(uid);
+    const codeSnap = await codeRef.get();
+    if (!codeSnap.exists) return res.status(400).json({ error: 'no-code' });
+    const cd = codeSnap.data();
+    if (Date.now() > cd.expMs) { await codeRef.delete(); return res.status(400).json({ error: 'expired' }); }
+    if ((cd.tries || 0) >= 5) return res.status(429).json({ error: 'too-many' });
+    if (String(code).trim() !== String(cd.code)) { await codeRef.update({ tries: (cd.tries || 0) + 1 }); return res.status(400).json({ error: 'wrong-code' }); }
+    await codeRef.delete();
     const ref = adminDb.collection('businesses').doc(uid);
     const snap = await ref.get();
     if (snap.exists && snap.data().proSubId) { try { await stripe.subscriptions.cancel(snap.data().proSubId); } catch (_) {} }
+    if (snap.exists && snap.data().businessTierSubId) { try { await stripe.subscriptions.cancel(snap.data().businessTierSubId); } catch (_) {} }
+    // Delete any branches this head office owns (their staff/tips/consents/code).
+    try {
+      const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
+      for (const br of brs.docs) {
+        for (const sub of ['staff', 'tips', 'consents']) {
+          try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {}
+        }
+        try { const c = br.data().shopCode; if (c) await adminDb.collection('shopCodes').doc(c).delete(); } catch (_) {}
+        try { await br.ref.delete(); } catch (_) {}
+      }
+    } catch (e) { console.error('delete branches', e.message); }
     for (const sub of ['staff', 'tips', 'consents']) {
       try {
         const docs = await ref.collection(sub).get();

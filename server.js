@@ -188,20 +188,20 @@ app.post('/create-payment-intent', async (req, res) => {
     }
 
     if (ready) {
-      // Direct destination charge (standard tipping-platform model): the platform
-      // is the merchant of record, the worker only needs the `transfers`
-      // capability (which they have) to RECEIVE. The tip goes straight to the
-      // worker (amount − application_fee), the commission (application_fee) stays
-      // with the platform, and Stripe's processing fee comes out of the platform's
-      // commission. The worker keeps 100% of the tip.
-      // (We do NOT use on_behalf_of — that requires the worker to have the
-      //  `card_payments` capability, i.e. be a card-processing merchant.)
+      // Direct destination charge (standard tipping-platform model). The platform
+      // is the merchant of record; the worker only needs the `transfers`
+      // capability (which they have) to RECEIVE.
+      //   transfer_data.amount = tip  → the worker gets EXACTLY the tip ($50),
+      //   shown as one clean transfer. The platform keeps the remainder (the
+      //   commission), out of which Stripe's processing fee is taken.
+      // We set transfer_data.amount explicitly (instead of application_fee_amount)
+      // so the worker's account shows a clean $50 — not "$53.50 minus a fee".
+      // (No on_behalf_of — that would require the worker to have `card_payments`.)
       const pi = await stripe.paymentIntents.create({
         amount: total,
         currency: cur,
         payment_method_types: ['card'],
-        application_fee_amount: commission,
-        transfer_data: { destination: workerAcct },
+        transfer_data: { destination: workerAcct, amount: tip },
         metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), held: '0' },
       });
       return res.json({

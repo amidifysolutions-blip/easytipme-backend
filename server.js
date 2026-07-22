@@ -825,6 +825,40 @@ app.post('/staff/sync-email', async (req, res) => {
   } catch (e) { console.error('sync-email', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Authenticated self-diagnostic — returns ONLY the caller's own tip data so we can
+// see why tips may not be matching (email vs staffId). No secret params; requires
+// the worker's own idToken. Safe: a worker can only ever see their own tips.
+app.post('/staff/my-tips-debug', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid } = req.body || {};
+    if (!idToken || !bid) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const email = (decoded.email || '').toLowerCase();
+    const bref = adminDb.collection('businesses').doc(bid);
+    // locate this worker's staff record
+    let staffEmail = '-', staffId = '-';
+    let sd = await bref.collection('staff').where('claimedUid', '==', decoded.uid).limit(1).get();
+    if (sd.empty) sd = await bref.collection('staff').where('email', '==', email).limit(1).get();
+    if (!sd.empty) { staffEmail = (sd.docs[0].data().email || '-'); staffId = sd.docs[0].id; }
+    // how many tips match by login email vs by this staff record's id
+    let byEmail = 0, byStaff = 0, recent = [];
+    try { byEmail = (await bref.collection('tips').where('recipientEmails', 'array-contains', email).get()).size; } catch (e) {}
+    if (staffId !== '-') {
+      try {
+        const st = await bref.collection('tips').where('recipientIds', 'array-contains', staffId).get();
+        byStaff = st.size;
+        const docs = st.docs.sort((a, b) => {
+          const ta = a.data().createdAt, tb = b.data().createdAt;
+          return ((tb && tb.toMillis ? tb.toMillis() : 0) - (ta && ta.toMillis ? ta.toMillis() : 0));
+        }).slice(0, 6);
+        recent = docs.map(d => { const t = d.data(); return { rE: t.recipientEmails || [], from: t.fromName || '', msg: t.message || '', tip: t.tip || 0 }; });
+      } catch (e) {}
+    }
+    res.json({ ok: true, login: email, staffEmail, staffId, byEmail, byStaff, recent });
+  } catch (e) { console.error('my-tips-debug', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Contact / support form → emails the support inbox (reply-to the sender).
 app.post('/contact', async (req, res) => {
   try {

@@ -236,19 +236,29 @@ app.post('/create-payment-intent', async (req, res) => {
           }
         }
       } catch (_) {}
-      const workerTransfer = tip - monthlyFeeCents;
+      // --- Station 2: owner's administrative fee -----------------------------
+      // A % of the tip the BUSINESS retains (set in the dashboard, gated behind
+      // Pro). It is deducted from the worker's share here and routed to the
+      // owner's connected account after the charge succeeds (/settle-owner-fee).
+      // When the fee is off (the default), ownerShare is 0 and nothing changes.
+      let ownerShare = 0;
+      if (biz.tipShareEnabled === true) {
+        const sp = Math.min(15, Math.max(0, Number(biz.tipSharePercent) || 0));
+        ownerShare = Math.round(tip * sp / 100);
+      }
+      const workerTransfer = tip - ownerShare - monthlyFeeCents;
 
       const pi = await stripe.paymentIntents.create({
         amount: total,
         currency: cur,
         payment_method_types: ['card'],
         transfer_data: { destination: workerAcct, amount: workerTransfer },
-        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), monthlyFee: String(monthlyFeeCents), held: '0' },
+        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), monthlyFee: String(monthlyFeeCents), ownerShare: String(ownerShare), held: '0' },
       });
       return res.json({
         clientSecret: pi.client_secret,
         publishableKey: STRIPE_PUBLISHABLE_KEY,
-        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed, monthlyFee: monthlyFeeCents },
+        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed, monthlyFee: monthlyFeeCents, ownerShare },
         held: false,
       });
     }
@@ -716,6 +726,43 @@ app.post('/branch/settings', async (req, res) => {
     await adminDb.collection('businesses').doc(id).set(upd, { merge: true });
     res.json({ ok: true });
   } catch (e) { console.error('branch settings', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Station 2 settlement: after a tip charge succeeds, move the owner's admin fee
+// to the owner's connected account (the head office, for a branch). Idempotent —
+// safe to call more than once. Does nothing when there is no admin fee.
+app.post('/settle-owner-fee', async (req, res) => {
+  try {
+    if (!adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { paymentId } = req.body;
+    if (!paymentId) return res.status(400).json({ error: 'missing-fields' });
+    const pi = await stripe.paymentIntents.retrieve(paymentId);
+    if (!pi || pi.status !== 'succeeded') return res.json({ ok: false, reason: 'not-succeeded' });
+    const md = pi.metadata || {};
+    const ownerShare = parseInt(md.ownerShare || '0', 10);
+    const businessId = md.businessId;
+    if (!(ownerShare > 0) || !businessId) return res.json({ ok: true, transferred: 0 });
+    const bizSnap = await adminDb.collection('businesses').doc(businessId).get();
+    const biz = bizSnap.exists ? bizSnap.data() : {};
+    const ownerUid = biz.orgOwnerUid || businessId;     // branch → head office; main → itself
+    let ownerData = biz;
+    if (biz.orgOwnerUid) { const os = await adminDb.collection('businesses').doc(ownerUid).get(); ownerData = os.exists ? os.data() : {}; }
+    const ownerAcct = ownerData.ownerConnectAccountId;
+    let ready = false;
+    if (ownerAcct) { try { const a = await stripe.accounts.retrieve(ownerAcct); ready = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled); } catch (_) {} }
+    if (!ready) return res.json({ ok: true, transferred: 0, held: true });
+    try {
+      await stripe.transfers.create({
+        amount: ownerShare, currency: pi.currency, destination: ownerAcct,
+        source_transaction: pi.latest_charge,
+        metadata: { kind: 'owner-fee', businessId, paymentId }
+      }, { idempotencyKey: 'ownerfee_' + paymentId });
+      return res.json({ ok: true, transferred: ownerShare });
+    } catch (e) {
+      console.error('owner-fee transfer', e.message);
+      return res.json({ ok: false, error: e.message, held: true });
+    }
+  } catch (e) { console.error('settle-owner-fee', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Contact / support form → emails the support inbox (reply-to the sender).

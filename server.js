@@ -349,6 +349,61 @@ app.post('/billing/confirm', async (req, res) => {
   } catch (e) { console.error('billing confirm', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Cancel a Pro subscription (owner or worker) — the account owner cancels their own.
+app.post('/billing/cancel', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, plan } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (plan === 'worker') {
+      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
+      let subId = '';
+      g.forEach(d => { if (!subId && d.data().workerProSubId) subId = d.data().workerProSubId; });
+      if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+      const batch = adminDb.batch();
+      g.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }));
+      await batch.commit();
+    } else {
+      const ref = adminDb.collection('businesses').doc(decoded.uid);
+      const snap = await ref.get();
+      const subId = snap.exists ? snap.data().proSubId : '';
+      if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+      await ref.set({ proActive: false, proCancelledAt: new Date().toISOString() }, { merge: true });
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('billing cancel', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Delete a BUSINESS account — the owner permanently removes their own shop.
+// Removes the business doc, its staff/tips/consents, its shop code, cancels any
+// Pro subscription, and deletes the owner's Firebase login. Workers' own accounts
+// and bank connections are NOT touched (they may belong to other shops).
+app.post('/business/delete', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const ref = adminDb.collection('businesses').doc(uid);
+    const snap = await ref.get();
+    if (snap.exists && snap.data().proSubId) { try { await stripe.subscriptions.cancel(snap.data().proSubId); } catch (_) {} }
+    for (const sub of ['staff', 'tips', 'consents']) {
+      try {
+        const docs = await ref.collection(sub).get();
+        let batch = adminDb.batch(), n = 0;
+        for (const d of docs.docs) { batch.delete(d.ref); if (++n >= 400) { await batch.commit(); batch = adminDb.batch(); n = 0; } }
+        if (n > 0) await batch.commit();
+      } catch (e) { console.error('delete sub ' + sub, e.message); }
+    }
+    try { const codes = await adminDb.collection('shopCodes').where('bid', '==', uid).get(); const b = adminDb.batch(); codes.forEach(d => b.delete(d.ref)); await b.commit(); } catch (_) {}
+    try { await ref.delete(); } catch (e) { console.error('delete biz doc', e.message); }
+    try { await adminAuth.deleteUser(uid); } catch (e) { console.error('delete auth', e.message); }
+    res.json({ ok: true });
+  } catch (e) { console.error('business delete', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Contact / support form → emails the support inbox (reply-to the sender).
 app.post('/contact', async (req, res) => {
   try {

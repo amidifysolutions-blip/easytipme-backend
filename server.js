@@ -231,10 +231,24 @@ app.get('/stripe-config', (req, res) => {
   res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
 });
 
-// Send an email to staff when they receive a tip (via Brevo)
+// Admin alert email for a large tip (shown when a single tip total >= threshold)
+function adminBigTipHtml(shopName, who, cur, amt, fromName) {
+  const shop = shopName ? escapeHtml(shopName) : 'a shop';
+  const to = who ? escapeHtml(who) : 'the team';
+  const from = fromName ? escapeHtml(fromName) : 'A customer';
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Large tip received 💸</div>
+    <div style="font-size:34px;font-weight:800;color:#0071e3;margin:14px 0 6px;">${escapeHtml(cur)} ${escapeHtml(amt)}</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:8px 0 0;">${from} tipped <b>${to}</b> at <b>${shop}</b>.</p>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:18px 0 0;">Automatic alert for tips at or above the alert threshold.</p>
+  </div>`);
+}
+
+// Send an email to staff when they receive a tip (via Brevo). Also alerts the
+// admin when the whole tip is large (>= ADMIN_TIP_ALERT, default 30).
 app.post('/notify-tip', async (req, res) => {
   try {
-    const { recipients, amount, currency, shopName, fromName } = req.body;
+    const { recipients, amount, currency, shopName, fromName, tipTotal } = req.body;
     const apiKey = process.env.BREVO_API_KEY;
     const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
     const senderName = process.env.SENDER_NAME || 'EasyTipMe';
@@ -246,7 +260,8 @@ app.post('/notify-tip', async (req, res) => {
     for (const r of list) {
       const payload = {
         sender: { name: senderName, email: senderEmail },
-        to: [{ email: r.email, name: r.name || '' }],
+        // name must be omitted (undefined) when empty — Brevo rejects an empty string.
+        to: [{ email: r.email, name: r.name || undefined }],
         subject: (fromName ? (fromName + ' sent you a tip! 🎉') : 'You received a tip! 🎉'),
         htmlContent: tipEmailHtml(r.name, cur, amt, shopName, fromName)
       };
@@ -259,6 +274,27 @@ app.post('/notify-tip', async (req, res) => {
         if (resp.ok) sent++;
       } catch (e) { console.error('brevo send error', e.message); }
     }
+
+    // Admin large-tip alert.
+    const threshold = Number(process.env.ADMIN_TIP_ALERT || 30);
+    const total = Number(tipTotal != null ? tipTotal : amount || 0);
+    const adminEmail = process.env.ADMIN_EMAIL || 'amidifysolutions@gmail.com';
+    if (total >= threshold && adminEmail) {
+      const who = (list[0] && list[0].name) || (recipients && recipients[0] && recipients[0].name) || '';
+      try {
+        await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST',
+          headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({
+            sender: { name: senderName, email: senderEmail },
+            to: [{ email: adminEmail }],
+            subject: `💸 Large tip: ${cur} ${total.toFixed(2)}${shopName ? ' at ' + shopName : ''}`,
+            htmlContent: adminBigTipHtml(shopName, who, cur, total.toFixed(2), fromName)
+          })
+        });
+      } catch (e) { console.error('admin alert send error', e.message); }
+    }
+
     res.json({ sent });
   } catch (error) {
     console.error(error);
@@ -707,6 +743,64 @@ app.post('/connect/balance', async (req, res) => {
       payouts
     });
   } catch (e) { console.error('connect balance', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Release tips that were held while a worker hadn't finished connecting their
+// bank. Called by the worker's app once their Connect account is ready. Finds
+// every held+unreleased tip recorded against this worker and transfers the
+// worker's share to their account, then marks it released. Idempotent per tip.
+app.post('/staff/release-held', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing idToken' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+
+    // Every staff record this worker owns (invited workers are linked by claimedUid).
+    const staffDocs = [];
+    try {
+      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
+      g.forEach(d => staffDocs.push(d));
+    } catch (e) { console.error('release-held staff lookup', e.message); }
+
+    let released = 0, totalCents = 0, currency = null;
+    for (const sd of staffDocs) {
+      const staff = sd.data();
+      const acctId = staff.connectAccountId;
+      if (!acctId) continue;
+      // Must actually be able to receive before we move money.
+      let ok = false;
+      try { const a = await stripe.accounts.retrieve(acctId); ok = !!a.charges_enabled; } catch (_) { ok = false; }
+      if (!ok) continue;
+      const bizRef = sd.ref.parent.parent;   // businesses/{bid}
+      if (!bizRef) continue;
+      const staffId = sd.id;
+      // Held tips for this worker (single-field query → no composite index needed).
+      let tipsSnap;
+      try { tipsSnap = await bizRef.collection('tips').where('staffId', '==', staffId).get(); }
+      catch (e) { console.error('release-held tips query', e.message); continue; }
+      for (const t of tipsSnap.docs) {
+        const td = t.data();
+        if (td.held !== true || td.released === true) continue;
+        const owed = Math.round(Number(td.staffShare != null ? td.staffShare : td.tip) * 100);
+        const cur = (td.currency || 'cad').toLowerCase();
+        if (!(owed > 0)) { await t.ref.update({ released: true, releasedAt: new Date().toISOString(), releaseNote: 'zero-amount' }); continue; }
+        try {
+          const tr = await stripe.transfers.create({
+            amount: owed, currency: cur, destination: acctId,
+            metadata: { kind: 'held-release', businessId: bizRef.id, staffId, tipId: t.id }
+          }, { idempotencyKey: 'release_' + t.id });
+          await t.ref.update({ released: true, releasedAt: new Date().toISOString(), transferId: tr.id });
+          released++; totalCents += owed; currency = cur;
+        } catch (e) {
+          // Leave released:false so it retries next time (e.g. balance not yet available).
+          console.error('release transfer failed', t.id, e.message);
+        }
+      }
+    }
+    res.json({ ok: true, released, amount: totalCents / 100, currency });
+  } catch (e) { console.error('release-held', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Owner (business) connects THEIR OWN payout account — destination for their

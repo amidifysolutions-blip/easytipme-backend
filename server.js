@@ -287,10 +287,18 @@ app.get('/stripe-config', (req, res) => {
 // worker pays EasyTipMe) — separate from the Connect tip flow.
 const STRIPE_IS_LIVE = String(process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live');
 const PLAN_INFO = {
-  owner:    { keyBase: 'ownerPrice',    amount: 1999, name: 'EasyTipMe Pro — Business' },
-  worker:   { keyBase: 'workerPrice',   amount: 499,  name: 'EasyTipMe Pro — Worker' },
-  business: { keyBase: 'businessPrice', amount: 4999, name: 'EasyTipMe Business — Multi-location' }
+  owner:       { keyBase: 'ownerPrice',       amount: 1999, name: 'EasyTipMe Pro' },
+  worker:      { keyBase: 'workerPrice',      amount: 499,  name: 'EasyTipMe Pro — Worker' },
+  business:    { keyBase: 'businessPrice',    amount: 4999, name: 'EasyTipMe Business — up to 10 locations' },
+  businesspro: { keyBase: 'businessProPrice', amount: 9999, name: 'EasyTipMe Business Pro — up to 25 locations' }
 };
+// Max branches allowed by the active multi-location plan.
+const BRANCH_LIMITS = { business: 10, businesspro: 25 };
+function branchLimitFor(b) {
+  if (b && b.businessProActive === true) return BRANCH_LIMITS.businesspro;
+  if (b && b.businessTierActive === true) return BRANCH_LIMITS.business;
+  return 0;
+}
 async function getProPriceId(plan) {
   const info = PLAN_INFO[plan] || PLAN_INFO.owner;
   const ref = adminDb.collection('config').doc('billing');
@@ -322,8 +330,8 @@ app.post('/billing/create-checkout', async (req, res) => {
       line_items: [{ price, quantity: 1 }],
       customer_email: decoded.email || undefined,
       metadata: { plan, uid: decoded.uid, bid: bid || '', staffId: staffId || '' },
-      success_url: backTo + (plan === 'business' ? '?biz=success' : '?pro=success') + '&session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: backTo + (plan === 'business' ? '?biz=cancel' : '?pro=cancel')
+      success_url: backTo + ((plan === 'business' || plan === 'businesspro') ? '?biz=success' : '?pro=success') + '&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: backTo + ((plan === 'business' || plan === 'businesspro') ? '?biz=cancel' : '?pro=cancel')
     });
     res.json({ url: session.url });
   } catch (e) { console.error('create-checkout', e.message); res.status(500).json({ error: e.message }); }
@@ -341,7 +349,15 @@ app.post('/billing/confirm', async (req, res) => {
     if (!paid) return res.json({ ok: false, active: false });
     const md = session.metadata || {};
     if (md.uid && md.uid !== decoded.uid) return res.status(403).json({ error: 'mismatch' });
-    if (md.plan === 'business') {
+    if (md.plan === 'businesspro') {
+      // Upgrading to Business Pro supersedes the lower Business plan — cancel it.
+      const ref = adminDb.collection('businesses').doc(decoded.uid);
+      const cur = await ref.get();
+      if (cur.exists && cur.data().businessTierSubId) { try { await stripe.subscriptions.cancel(cur.data().businessTierSubId); } catch (_) {} }
+      await ref.set(
+        { businessProActive: true, businessProSince: new Date().toISOString(), businessProSubId: session.subscription || '',
+          businessTierActive: false, businessTierSubId: '' }, { merge: true });
+    } else if (md.plan === 'business') {
       await adminDb.collection('businesses').doc(decoded.uid).set(
         { businessTierActive: true, businessTierSince: new Date().toISOString(), businessTierSubId: session.subscription || '' }, { merge: true });
     } else if (md.plan === 'owner') {
@@ -373,6 +389,12 @@ app.post('/billing/cancel', async (req, res) => {
       const batch = adminDb.batch();
       g.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }));
       await batch.commit();
+    } else if (plan === 'businesspro') {
+      const ref = adminDb.collection('businesses').doc(decoded.uid);
+      const snap = await ref.get();
+      const subId = snap.exists ? snap.data().businessProSubId : '';
+      if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+      await ref.set({ businessProActive: false, businessProCancelledAt: new Date().toISOString() }, { merge: true });
     } else if (plan === 'business') {
       const ref = adminDb.collection('businesses').doc(decoded.uid);
       const snap = await ref.get();
@@ -451,6 +473,7 @@ app.post('/business/delete', async (req, res) => {
     const snap = await ref.get();
     if (snap.exists && snap.data().proSubId) { try { await stripe.subscriptions.cancel(snap.data().proSubId); } catch (_) {} }
     if (snap.exists && snap.data().businessTierSubId) { try { await stripe.subscriptions.cancel(snap.data().businessTierSubId); } catch (_) {} }
+    if (snap.exists && snap.data().businessProSubId) { try { await stripe.subscriptions.cancel(snap.data().businessProSubId); } catch (_) {} }
     // Delete any branches this head office owns (their staff/tips/consents/code).
     try {
       const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
@@ -496,8 +519,12 @@ app.post('/branch/create', async (req, res) => {
     if (!idToken) return res.status(400).json({ error: 'missing-fields' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     const head = await adminDb.collection('businesses').doc(decoded.uid).get();
-    if (!head.exists || head.data().businessTierActive !== true) return res.status(403).json({ error: 'business-tier-required' });
-    const hd = head.data();
+    const hd = head.exists ? head.data() : {};
+    const limit = branchLimitFor(hd);
+    if (limit <= 0) return res.status(403).json({ error: 'business-tier-required' });
+    // Enforce the plan's branch cap.
+    const existing = await adminDb.collection('businesses').where('orgOwnerUid', '==', decoded.uid).get();
+    if (existing.size >= limit) return res.status(403).json({ error: 'branch-limit', limit });
     const branchRef = adminDb.collection('businesses').doc();
     const code = await uniqueShopCode();
     await branchRef.set({
@@ -536,7 +563,8 @@ app.post('/branch/list', async (req, res) => {
     const g = await adminDb.collection('businesses').where('orgOwnerUid', '==', decoded.uid).get();
     for (const d of g.docs) branches.push(await statsFor(d.ref, d.data(), false));
     branches.sort((a, b) => (a.isMain ? -1 : b.isMain ? 1 : (a.createdAt < b.createdAt ? -1 : 1)));
-    res.json({ ok: true, branches });
+    const limit = branchLimitFor(mainSnap.exists ? mainSnap.data() : {});
+    res.json({ ok: true, branches, limit, used: g.size });
   } catch (e) { console.error('branch list', e.message); res.status(500).json({ error: e.message }); }
 });
 

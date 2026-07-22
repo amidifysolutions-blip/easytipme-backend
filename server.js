@@ -280,6 +280,60 @@ app.get('/stripe-config', (req, res) => {
   res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
 });
 
+// Contact / support form → emails the support inbox (reply-to the sender).
+app.post('/contact', async (req, res) => {
+  try {
+    const name = String((req.body && req.body.name) || '').trim().slice(0, 80);
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase().slice(0, 120);
+    const subject = String((req.body && req.body.subject) || '').trim().slice(0, 140);
+    const message = String((req.body && req.body.message) || '').trim().slice(0, 4000);
+    const role = String((req.body && req.body.role) || '').trim().slice(0, 40);
+    if (!email || !/.+@.+\..+/.test(email) || !message) return res.status(400).json({ sent: 0, error: 'missing-fields' });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    const supportEmail = process.env.SUPPORT_EMAIL || 'info@easytipme.com';
+    if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
+    const body = emailShell(`
+      <div style="font-size:18px;font-weight:800;color:#0a0a0a;margin-bottom:10px;">New contact message 📩</div>
+      <table style="width:100%;font-size:14px;color:#333;border-collapse:collapse;">
+        <tr><td style="padding:6px 0;color:#9a9aa0;width:90px;">Name</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(name || '—')}</td></tr>
+        <tr><td style="padding:6px 0;color:#9a9aa0;">Email</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(email)}</td></tr>
+        ${role ? `<tr><td style="padding:6px 0;color:#9a9aa0;">Role</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(role)}</td></tr>` : ''}
+        <tr><td style="padding:6px 0;color:#9a9aa0;">Subject</td><td style="padding:6px 0;font-weight:600;">${escapeHtml(subject || '—')}</td></tr>
+      </table>
+      <div style="margin-top:14px;padding:14px;background:#f6f7fb;border-radius:12px;font-size:14px;color:#111;line-height:1.6;white-space:pre-wrap;">${escapeHtml(message)}</div>
+      <p style="font-size:12px;color:#9a9aa0;margin-top:16px;">Reply directly to this email to respond to ${escapeHtml(name || email)}.</p>`);
+    let sent = 0;
+    try {
+      const resp = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({
+          sender: { name: senderName, email: senderEmail },
+          to: [{ email: supportEmail }],
+          replyTo: { email, name: name || undefined },
+          subject: `📩 Contact: ${subject || 'New message'} — ${name || email}`,
+          htmlContent: body
+        })
+      });
+      sent = resp.ok ? 1 : 0;
+    } catch (e) { console.error('contact send', e.message); }
+    // Friendly auto-acknowledgement to the sender (best-effort).
+    try {
+      await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({
+          sender: { name: senderName, email: senderEmail },
+          to: [{ email, name: name || undefined }],
+          subject: 'We got your message — EasyTipMe',
+          htmlContent: emailShell(`<div style="text-align:center"><div style="font-size:20px;font-weight:800;color:#0a0a0a;">Thanks for reaching out 🙌</div><p style="font-size:15px;color:#333;line-height:1.6;margin:12px 0 0;">We received your message and will get back to you soon. If it's urgent, just reply to this email.</p></div>`)
+        })
+      });
+    } catch (_) {}
+    res.json({ sent });
+  } catch (e) { console.error('contact', e.message); res.status(500).json({ sent: 0, error: e.message }); }
+});
+
 // ---- Password reset via a 6-digit code (standard "forgot password" OTP) ----
 // The user forgot their password. We email a one-time code to THEIR OWN address
 // (which proves they control the account), they type the code + a new password,

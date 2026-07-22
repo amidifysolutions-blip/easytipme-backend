@@ -280,6 +280,75 @@ app.get('/stripe-config', (req, res) => {
   res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
 });
 
+// ---- Pro subscriptions (Stripe Billing) — Phase 1 foundation ----------------
+// Owner Pro ($19.99/mo) and Worker Pro ($4.99/mo). Prices are created lazily on
+// first use and cached in config/billing (per test/live mode) so there is no
+// manual Stripe setup. The subscription is a normal platform charge (the owner/
+// worker pays EasyTipMe) — separate from the Connect tip flow.
+const STRIPE_IS_LIVE = String(process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live');
+async function getProPriceId(plan) {
+  const ref = adminDb.collection('config').doc('billing');
+  const snap = await ref.get();
+  const data = snap.exists ? (snap.data() || {}) : {};
+  const key = (plan === 'owner' ? 'ownerPrice' : 'workerPrice') + (STRIPE_IS_LIVE ? '_live' : '_test');
+  if (data[key]) return data[key];
+  const price = await stripe.prices.create({
+    currency: 'usd',
+    unit_amount: plan === 'owner' ? 1999 : 499,
+    recurring: { interval: 'month' },
+    product_data: { name: plan === 'owner' ? 'EasyTipMe Pro — Business' : 'EasyTipMe Pro — Worker' }
+  });
+  await ref.set({ [key]: price.id }, { merge: true });
+  return price.id;
+}
+
+// Start a Pro subscription: returns a Stripe Checkout URL to redirect the user to.
+app.post('/billing/create-checkout', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, plan, bid, staffId } = req.body;
+    if (!idToken || (plan !== 'owner' && plan !== 'worker')) return res.status(400).json({ error: 'bad-request' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const backTo = plan === 'owner' ? (APP_URL + '/dashboard.html') : (APP_URL + '/staff.html');
+    const price = await getProPriceId(plan);
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price, quantity: 1 }],
+      customer_email: decoded.email || undefined,
+      metadata: { plan, uid: decoded.uid, bid: bid || '', staffId: staffId || '' },
+      success_url: backTo + '?pro=success&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: backTo + '?pro=cancel'
+    });
+    res.json({ url: session.url });
+  } catch (e) { console.error('create-checkout', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Confirm a completed checkout (called after redirect) and flip the Pro flag.
+app.post('/billing/confirm', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, sessionId } = req.body;
+    if (!idToken || !sessionId) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const paid = session && (session.payment_status === 'paid' || session.status === 'complete');
+    if (!paid) return res.json({ ok: false, active: false });
+    const md = session.metadata || {};
+    if (md.uid && md.uid !== decoded.uid) return res.status(403).json({ error: 'mismatch' });
+    if (md.plan === 'owner') {
+      await adminDb.collection('businesses').doc(decoded.uid).set(
+        { proActive: true, proSince: new Date().toISOString(), proSubId: session.subscription || '' }, { merge: true });
+    } else {
+      // Worker Pro applies to the person: tag every staff record they've claimed.
+      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
+      const batch = adminDb.batch();
+      g.forEach(d => batch.set(d.ref, { workerProActive: true, workerProSince: new Date().toISOString(), workerProSubId: session.subscription || '' }, { merge: true }));
+      await batch.commit();
+    }
+    res.json({ ok: true, active: true });
+  } catch (e) { console.error('billing confirm', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Contact / support form → emails the support inbox (reply-to the sender).
 app.post('/contact', async (req, res) => {
   try {

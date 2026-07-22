@@ -149,24 +149,26 @@ app.post('/create-payment-intent', async (req, res) => {
     if (biz.blocked) return res.status(403).json({ error: 'shop-unavailable' });
     const cur = (currency || biz.currency || 'cad').toLowerCase();
 
-    // Station 1: platform commission — a % ADDED ON TOP of the tip.
-    // Priority: per-shop rate (set in master, businesses/{id}.commissionPercent)
-    //   → global default (config/platform.commissionPercent)
-    //   → 7% fallback.
-    // This lets you charge some shops a higher rate than others.
+    // Station 1: platform commission — a % of the tip PLUS a small fixed fee,
+    // both ADDED ON TOP of the tip. The fixed part covers Stripe's fixed
+    // per-transaction cost (~$0.30) so even small tips stay profitable
+    // (industry standard, e.g. TackPay charges "5% + £0.25").
+    // Priority for each value: per-shop → global default (config/platform) → fallback.
+    let cfgData = {};
+    try { const cfg = await adminDb.collection('config').doc('platform').get(); if (cfg.exists) cfgData = cfg.data() || {}; } catch (_) {}
+
     let commPct = null;
-    if (biz.commissionPercent != null && !isNaN(Number(biz.commissionPercent))) {
-      commPct = Number(biz.commissionPercent);
-    } else {
-      try {
-        const cfg = await adminDb.collection('config').doc('platform').get();
-        if (cfg.exists && cfg.data().commissionPercent != null) commPct = Number(cfg.data().commissionPercent);
-      } catch (_) {}
-    }
+    if (biz.commissionPercent != null && !isNaN(Number(biz.commissionPercent))) commPct = Number(biz.commissionPercent);
+    else if (cfgData.commissionPercent != null) commPct = Number(cfgData.commissionPercent);
     if (commPct == null || !(commPct >= 0)) commPct = 7;
 
-    const commission = Math.round(tip * commPct / 100);   // platform keeps this
-    const total = tip + commission;                        // customer pays this
+    let commFixed = null;   // in the tip's currency units (e.g. 0.30 = $0.30)
+    if (biz.commissionFixed != null && !isNaN(Number(biz.commissionFixed))) commFixed = Number(biz.commissionFixed);
+    else if (cfgData.commissionFixed != null) commFixed = Number(cfgData.commissionFixed);
+    if (commFixed == null || !(commFixed >= 0)) commFixed = 0.30;
+
+    const commission = Math.round(tip * commPct / 100) + Math.round(commFixed * 100);  // cents; platform keeps this
+    const total = tip + commission;                                                     // customer pays this
 
     const stfSnap = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(staffId).get();
     if (!stfSnap.exists) return res.status(404).json({ error: 'staff-not-found' });
@@ -202,12 +204,12 @@ app.post('/create-payment-intent', async (req, res) => {
         currency: cur,
         payment_method_types: ['card'],
         transfer_data: { destination: workerAcct, amount: tip },
-        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), held: '0' },
+        metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), held: '0' },
       });
       return res.json({
         clientSecret: pi.client_secret,
         publishableKey: STRIPE_PUBLISHABLE_KEY,
-        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct },
+        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed },
         held: false,
       });
     }
@@ -220,12 +222,12 @@ app.post('/create-payment-intent', async (req, res) => {
       amount: total,
       currency: cur,
       payment_method_types: ['card'],
-      metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), held: '1' },
+      metadata: { businessId, staffId, tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), held: '1' },
     });
     return res.json({
       clientSecret: pi.client_secret,
       publishableKey: STRIPE_PUBLISHABLE_KEY,
-      breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct },
+      breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed },
       held: true,
     });
   } catch (error) {

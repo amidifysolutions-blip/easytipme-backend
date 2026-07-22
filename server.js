@@ -616,6 +616,108 @@ app.post('/branch/delete', async (req, res) => {
   } catch (e) { console.error('branch delete', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ---- Branch team management (full management of each location) --------------
+// A location is "owned" by a user if it's their own shop, or a branch whose
+// orgOwnerUid is them. All of this runs via the Admin SDK so the head office can
+// manage every branch's team + settings without any Firestore rules change.
+async function ownsLocation(uid, id) {
+  if (!id || !uid) return false;
+  if (id === uid) return true;
+  try { const s = await adminDb.collection('businesses').doc(id).get(); return s.exists && s.data().orgOwnerUid === uid; } catch (_) { return false; }
+}
+const STAFF_FIELDS = ['nickname', 'realName', 'email', 'phone', 'job', 'photo', 'days', 'shift1', 'shift2', 'published', 'status'];
+function cleanStaff(data) {
+  const out = {};
+  for (const k of STAFF_FIELDS) { if (data && data[k] !== undefined) out[k] = data[k]; }
+  if (out.email) out.email = String(out.email).toLowerCase().trim();
+  return out;
+}
+
+// List a location's team + basic info (owner-only).
+app.post('/branch/team', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id } = req.body;
+    if (!idToken || !id) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await ownsLocation(decoded.uid, id))) return res.status(403).json({ error: 'not-your-location' });
+    const bref = adminDb.collection('businesses').doc(id);
+    const bsnap = await bref.get(); const b = bsnap.exists ? bsnap.data() : {};
+    const ss = await bref.collection('staff').get();
+    const staff = ss.docs.map(d => Object.assign({ id: d.id }, d.data()));
+    res.json({ ok: true, name: b.businessName || '', currency: b.currency || 'CAD', shopCode: b.shopCode || '', tipPresets: b.tipPresets || [5, 10, 20, ''], staff });
+  } catch (e) { console.error('branch team', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Add / update a team member on a location (owner-only). The invite email is
+// sent separately by the client via /staff/invite (now branch-aware).
+app.post('/branch/staff/save', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id, staffId, data } = req.body;
+    if (!idToken || !id || !data || !data.nickname) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await ownsLocation(decoded.uid, id))) return res.status(403).json({ error: 'not-your-location' });
+    const col = adminDb.collection('businesses').doc(id).collection('staff');
+    const clean = cleanStaff(data);
+    if (staffId) { await col.doc(staffId).set(clean, { merge: true }); return res.json({ ok: true, staffId }); }
+    clean.published = clean.published !== false;
+    clean.createdAt = new Date().toISOString();
+    const ref = await col.add(clean);
+    res.json({ ok: true, staffId: ref.id, created: true });
+  } catch (e) { console.error('branch staff save', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Remove / restore / hard-delete a team member on a location (owner-only).
+app.post('/branch/staff/remove', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id, staffId, action } = req.body;
+    if (!idToken || !id || !staffId) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await ownsLocation(decoded.uid, id))) return res.status(403).json({ error: 'not-your-location' });
+    const ref = adminDb.collection('businesses').doc(id).collection('staff').doc(staffId);
+    if (action === 'delete') { await ref.delete(); }
+    else if (action === 'restore') { await ref.set({ status: 'active', published: true }, { merge: true }); }
+    else { await ref.set({ status: 'removed', published: false }, { merge: true }); }
+    res.json({ ok: true });
+  } catch (e) { console.error('branch staff remove', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Move a team member from one owned location to another.
+app.post('/branch/staff/move', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, fromId, toId, staffId } = req.body;
+    if (!idToken || !fromId || !toId || !staffId || fromId === toId) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await ownsLocation(decoded.uid, fromId)) || !(await ownsLocation(decoded.uid, toId))) return res.status(403).json({ error: 'not-your-location' });
+    const src = adminDb.collection('businesses').doc(fromId).collection('staff').doc(staffId);
+    const snap = await src.get(); if (!snap.exists) return res.status(404).json({ error: 'no-staff' });
+    const dst = adminDb.collection('businesses').doc(toId).collection('staff').doc();
+    await dst.set(Object.assign({}, snap.data(), { movedAt: new Date().toISOString() }));
+    await src.delete();
+    res.json({ ok: true, newId: dst.id });
+  } catch (e) { console.error('branch staff move', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Edit a location's settings (name, currency, tip presets) — owner-only.
+app.post('/branch/settings', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id, name, currency, tipPresets } = req.body;
+    if (!idToken || !id) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await ownsLocation(decoded.uid, id))) return res.status(403).json({ error: 'not-your-location' });
+    const upd = {};
+    if (typeof name === 'string' && name.trim()) upd.businessName = name.trim().slice(0, 80);
+    if (typeof currency === 'string' && currency) upd.currency = currency;
+    if (Array.isArray(tipPresets)) upd.tipPresets = tipPresets.slice(0, 4).map(n => Number(n) || 0).filter(n => n > 0);
+    await adminDb.collection('businesses').doc(id).set(upd, { merge: true });
+    res.json({ ok: true });
+  } catch (e) { console.error('branch settings', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Contact / support form → emails the support inbox (reply-to the sender).
 app.post('/contact', async (req, res) => {
   try {
@@ -848,7 +950,7 @@ app.post('/staff/invite', async (req, res) => {
     if (!idToken || !bid || !staffId || !email) return res.status(400).json({ error: 'missing fields' });
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
     const decoded = await adminAuth.verifyIdToken(idToken);
-    if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    if (!(await ownsLocation(decoded.uid, bid))) return res.status(403).json({ error: 'not-your-business' });
     const addr = String(email).toLowerCase();
     let uid = null, created = false, tempPass = null;
     try { const u = await adminAuth.getUserByEmail(addr); uid = u.uid; } catch (_) { /* no account yet */ }

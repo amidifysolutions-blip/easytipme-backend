@@ -280,6 +280,71 @@ app.get('/stripe-config', (req, res) => {
   res.json({ publishableKey: STRIPE_PUBLISHABLE_KEY });
 });
 
+// ---- Password reset via a 6-digit code (standard "forgot password" OTP) ----
+// The user forgot their password. We email a one-time code to THEIR OWN address
+// (which proves they control the account), they type the code + a new password,
+// and only then do we set the new password. Same UX as our email verification.
+function resetCodeHtml(code) {
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Reset your password</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 10px;">Enter this code in the app to set a new password:</p>
+    <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#0071e3;background:#f2f7ff;border-radius:14px;padding:16px 0;margin:0 0 10px;">${escapeHtml(code)}</div>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:10px 0 0;">This code expires in 15 minutes. If you didn't request it, ignore this email — your password stays unchanged.</p>
+  </div>`);
+}
+// Step 1: request a reset code (emailed to the account's own address).
+app.post('/reset-request', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.json({ sent: 0, error: 'admin-not-configured' });
+    const addr = String((req.body && req.body.email) || '').toLowerCase().trim();
+    if (!addr) return res.status(400).json({ sent: 0, error: 'no-email' });
+    let uid = null;
+    try { const u = await adminAuth.getUserByEmail(addr); uid = u.uid; } catch (_) {}
+    // Respond the same whether or not the account exists (don't leak existence).
+    if (!uid) return res.json({ sent: 1 });
+    const ref = adminDb.collection('resetCodes').doc(uid);
+    const now = Date.now();
+    const cur = await ref.get();
+    if (cur.exists && cur.data().lastSentMs && (now - cur.data().lastSentMs) < 25000) return res.json({ sent: 1 });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await ref.set({ code, email: addr, expMs: now + 15 * 60000, tries: 0, lastSentMs: now });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (apiKey) {
+      await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr }], subject: 'Your EasyTipMe password reset code', htmlContent: resetCodeHtml(code) })
+      });
+    }
+    res.json({ sent: 1 });
+  } catch (e) { console.error('reset-request', e.message); res.json({ sent: 0, error: e.message }); }
+});
+// Step 2: confirm the code and set the new password.
+app.post('/reset-confirm', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const addr = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const code = String((req.body && req.body.code) || '').trim();
+    const newPassword = String((req.body && req.body.newPassword) || '');
+    if (!addr || !code || !newPassword) return res.status(400).json({ error: 'missing-fields' });
+    if (newPassword.length < 8) return res.status(400).json({ error: 'weak-password' });
+    let uid = null;
+    try { const u = await adminAuth.getUserByEmail(addr); uid = u.uid; } catch (_) {}
+    if (!uid) return res.status(400).json({ error: 'invalid' });
+    const ref = adminDb.collection('resetCodes').doc(uid);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(400).json({ error: 'no-code' });
+    const d = snap.data();
+    if (Date.now() > d.expMs) { await ref.delete(); return res.status(400).json({ error: 'expired' }); }
+    if ((d.tries || 0) >= 5) return res.status(429).json({ error: 'too-many' });
+    if (code !== String(d.code)) { await ref.update({ tries: (d.tries || 0) + 1 }); return res.status(400).json({ error: 'wrong-code' }); }
+    await adminAuth.updateUser(uid, { password: newPassword });
+    await ref.delete();
+    res.json({ ok: true });
+  } catch (e) { console.error('reset-confirm', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Admin alert email for a large tip (shown when a single tip total >= threshold)
 function adminBigTipHtml(shopName, who, cur, amt, fromName) {
   const shop = shopName ? escapeHtml(shopName) : 'a shop';

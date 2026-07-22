@@ -879,7 +879,7 @@ app.post('/staff/my-tips-debug', async (req, res) => {
           const ta = a.data().createdAt, tb = b.data().createdAt;
           return ((tb && tb.toMillis ? tb.toMillis() : 0) - (ta && ta.toMillis ? ta.toMillis() : 0));
         }).slice(0, 6);
-        recent = docs.map(d => { const t = d.data(); return { rE: t.recipientEmails || [], from: t.fromName || '', msg: t.message || '', tip: t.tip || 0 }; });
+        recent = docs.map(d => { const t = d.data(); const ca = t.createdAt; let at = '-'; try { at = ca && ca.toDate ? ca.toDate().toISOString().slice(5, 16).replace('T', ' ') : '-'; } catch (_) {} return { at, rE: t.recipientEmails || [], from: t.fromName || '', msg: t.message || '', tip: t.tip || 0 }; });
       } catch (e) {}
     }
     res.json({ ok: true, login: email, staffEmail, staffId, byEmail, byStaff, recent });

@@ -349,20 +349,28 @@ app.post('/billing/confirm', async (req, res) => {
     if (!paid) return res.json({ ok: false, active: false });
     const md = session.metadata || {};
     if (md.uid && md.uid !== decoded.uid) return res.status(403).json({ error: 'mismatch' });
-    if (md.plan === 'businesspro') {
-      // Upgrading to Business Pro supersedes the lower Business plan — cancel it.
+    if (md.plan === 'owner' || md.plan === 'business' || md.plan === 'businesspro') {
+      // The three owner-side plans are MUTUALLY EXCLUSIVE — only one active at a
+      // time. Buying any of them cancels the other two subscriptions (no double
+      // charge) and switches the active plan. Higher plans include lower ones.
       const ref = adminDb.collection('businesses').doc(decoded.uid);
       const cur = await ref.get();
-      if (cur.exists && cur.data().businessTierSubId) { try { await stripe.subscriptions.cancel(cur.data().businessTierSubId); } catch (_) {} }
-      await ref.set(
-        { businessProActive: true, businessProSince: new Date().toISOString(), businessProSubId: session.subscription || '',
-          businessTierActive: false, businessTierSubId: '' }, { merge: true });
-    } else if (md.plan === 'business') {
-      await adminDb.collection('businesses').doc(decoded.uid).set(
-        { businessTierActive: true, businessTierSince: new Date().toISOString(), businessTierSubId: session.subscription || '' }, { merge: true });
-    } else if (md.plan === 'owner') {
-      await adminDb.collection('businesses').doc(decoded.uid).set(
-        { proActive: true, proSince: new Date().toISOString(), proSubId: session.subscription || '' }, { merge: true });
+      const cd = cur.exists ? (cur.data() || {}) : {};
+      const newSub = session.subscription || '';
+      const others = [];
+      if (md.plan !== 'owner') others.push(cd.proSubId);
+      if (md.plan !== 'business') others.push(cd.businessTierSubId);
+      if (md.plan !== 'businesspro') others.push(cd.businessProSubId);
+      for (const s of others) { if (s && s !== newSub) { try { await stripe.subscriptions.cancel(s); } catch (_) {} } }
+      await ref.set({
+        proActive: md.plan === 'owner',
+        proSubId: md.plan === 'owner' ? newSub : '',
+        businessTierActive: md.plan === 'business',
+        businessTierSubId: md.plan === 'business' ? newSub : '',
+        businessProActive: md.plan === 'businesspro',
+        businessProSubId: md.plan === 'businesspro' ? newSub : '',
+        planSince: new Date().toISOString()
+      }, { merge: true });
     } else {
       // Worker Pro applies to the person: tag every staff record they've claimed.
       const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();

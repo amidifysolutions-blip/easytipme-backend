@@ -167,6 +167,14 @@ app.post('/create-payment-intent', async (req, res) => {
     else if (cfgData.commissionFixed != null) commFixed = Number(cfgData.commissionFixed);
     if (commFixed == null || !(commFixed >= 0)) commFixed = 0.30;
 
+    // Flat amounts (fixed fee, $2 monthly fee) only make sense in currencies of a
+    // similar scale. We apply them for the launch currencies (USD/CAD/EUR/GBP);
+    // exotic-value currencies get the percentage only until we add per-currency
+    // amounts. This keeps a "2"-sized flat fee from being nonsense elsewhere.
+    const MAJOR_CUR = ['usd', 'cad', 'eur', 'gbp'];
+    const isMajor = MAJOR_CUR.includes(cur);
+    if (!isMajor) commFixed = 0;
+
     const commission = Math.round(tip * commPct / 100) + Math.round(commFixed * 100);  // cents; platform keeps this
     const total = tip + commission;                                                     // customer pays this
 
@@ -216,7 +224,7 @@ app.post('/create-payment-intent', async (req, res) => {
         const WINDOW = 30 * 24 * 60 * 60 * 1000;
         const lastMs = staff.lastFeeTakenAt ? Date.parse(staff.lastFeeTakenAt) : 0;
         const feeRecently = lastMs && (now - lastMs) < WINDOW;   // already charged this cycle
-        if (!feeRecently && tip >= FEE_MIN_TIP) {
+        if (isMajor && !feeRecently && tip >= FEE_MIN_TIP) {
           const winStart = now - WINDOW;
           const tipsSnap = await adminDb.collection('businesses').doc(businessId).collection('tips').where('staffId', '==', staffId).get();
           let earnedCents = tip;   // include the tip being paid now

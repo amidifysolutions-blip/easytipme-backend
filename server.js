@@ -224,7 +224,7 @@ app.post('/create-payment-intent', async (req, res) => {
         const WINDOW = 30 * 24 * 60 * 60 * 1000;
         const lastMs = staff.lastFeeTakenAt ? Date.parse(staff.lastFeeTakenAt) : 0;
         const feeRecently = lastMs && (now - lastMs) < WINDOW;   // already charged this cycle
-        if (isMajor && !feeRecently && tip >= FEE_MIN_TIP) {
+        if (isMajor && !feeRecently && tip >= FEE_MIN_TIP && staff.workerProActive !== true) {
           const winStart = now - WINDOW;
           const tipsSnap = await adminDb.collection('businesses').doc(businessId).collection('tips').where('staffId', '==', staffId).get();
           let earnedCents = tip;   // include the tip being paid now

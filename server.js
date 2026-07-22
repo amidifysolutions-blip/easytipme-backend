@@ -292,7 +292,7 @@ app.post('/contact', async (req, res) => {
     const apiKey = process.env.BREVO_API_KEY;
     const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
     const senderName = process.env.SENDER_NAME || 'EasyTipMe';
-    const supportEmail = process.env.SUPPORT_EMAIL || 'info@easytipme.com';
+    const supportEmail = process.env.SUPPORT_EMAIL || 'support@easytipme.com';
     if (!apiKey) return res.json({ sent: 0, note: 'BREVO_API_KEY not set' });
     const body = emailShell(`
       <div style="font-size:18px;font-weight:800;color:#0a0a0a;margin-bottom:10px;">New contact message 📩</div>

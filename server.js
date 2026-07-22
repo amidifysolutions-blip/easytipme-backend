@@ -382,11 +382,25 @@ app.post('/billing/confirm', async (req, res) => {
         planSince: new Date().toISOString()
       }, { merge: true });
     } else {
-      // Worker Pro applies to the person: tag every staff record they've claimed.
-      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
-      const batch = adminDb.batch();
-      g.forEach(d => batch.set(d.ref, { workerProActive: true, workerProSince: new Date().toISOString(), workerProSubId: session.subscription || '' }, { merge: true }));
-      await batch.commit();
+      // Worker Pro applies to the PERSON. Update the exact staff record from the
+      // checkout metadata FIRST (robust — no collection-group index needed), then
+      // best-effort tag any other records they've claimed. Cancel any previous
+      // worker subscription so a repeat subscribe never double-bills.
+      const newSub = session.subscription || '';
+      const since = new Date().toISOString();
+      const oldSubs = new Set();
+      const tag = async (ref, data) => {
+        if (data && data.workerProSubId && data.workerProSubId !== newSub) oldSubs.add(data.workerProSubId);
+        await ref.set({ workerProActive: true, workerProSince: since, workerProSubId: newSub }, { merge: true });
+      };
+      if (md.bid && md.staffId) {
+        try { const ref = adminDb.collection('businesses').doc(md.bid).collection('staff').doc(md.staffId); const s = await ref.get(); if (s.exists) await tag(ref, s.data()); } catch (e) { console.error('worker confirm direct', e.message); }
+      }
+      try {
+        const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
+        for (const d of g.docs) { await tag(d.ref, d.data()); }
+      } catch (e) { console.error('worker confirm cg', e.message); }
+      for (const s of oldSubs) { try { await stripe.subscriptions.cancel(s); } catch (_) {} }
     }
     res.json({ ok: true, active: true });
   } catch (e) { console.error('billing confirm', e.message); res.status(500).json({ error: e.message }); }

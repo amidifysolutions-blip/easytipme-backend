@@ -286,17 +286,23 @@ app.get('/stripe-config', (req, res) => {
 // manual Stripe setup. The subscription is a normal platform charge (the owner/
 // worker pays EasyTipMe) — separate from the Connect tip flow.
 const STRIPE_IS_LIVE = String(process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live');
+const PLAN_INFO = {
+  owner:    { keyBase: 'ownerPrice',    amount: 1999, name: 'EasyTipMe Pro — Business' },
+  worker:   { keyBase: 'workerPrice',   amount: 499,  name: 'EasyTipMe Pro — Worker' },
+  business: { keyBase: 'businessPrice', amount: 4999, name: 'EasyTipMe Business — Multi-location' }
+};
 async function getProPriceId(plan) {
+  const info = PLAN_INFO[plan] || PLAN_INFO.owner;
   const ref = adminDb.collection('config').doc('billing');
   const snap = await ref.get();
   const data = snap.exists ? (snap.data() || {}) : {};
-  const key = (plan === 'owner' ? 'ownerPrice' : 'workerPrice') + (STRIPE_IS_LIVE ? '_live' : '_test');
+  const key = info.keyBase + (STRIPE_IS_LIVE ? '_live' : '_test');
   if (data[key]) return data[key];
   const price = await stripe.prices.create({
     currency: 'usd',
-    unit_amount: plan === 'owner' ? 1999 : 499,
+    unit_amount: info.amount,
     recurring: { interval: 'month' },
-    product_data: { name: plan === 'owner' ? 'EasyTipMe Pro — Business' : 'EasyTipMe Pro — Worker' }
+    product_data: { name: info.name }
   });
   await ref.set({ [key]: price.id }, { merge: true });
   return price.id;
@@ -307,17 +313,17 @@ app.post('/billing/create-checkout', async (req, res) => {
   try {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
     const { idToken, plan, bid, staffId } = req.body;
-    if (!idToken || (plan !== 'owner' && plan !== 'worker')) return res.status(400).json({ error: 'bad-request' });
+    if (!idToken || !PLAN_INFO[plan]) return res.status(400).json({ error: 'bad-request' });
     const decoded = await adminAuth.verifyIdToken(idToken);
-    const backTo = plan === 'owner' ? (APP_URL + '/dashboard.html') : (APP_URL + '/staff.html');
+    const backTo = plan === 'worker' ? (APP_URL + '/staff.html') : (APP_URL + '/dashboard.html');
     const price = await getProPriceId(plan);
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price, quantity: 1 }],
       customer_email: decoded.email || undefined,
       metadata: { plan, uid: decoded.uid, bid: bid || '', staffId: staffId || '' },
-      success_url: backTo + '?pro=success&session_id={CHECKOUT_SESSION_ID}',
-      cancel_url: backTo + '?pro=cancel'
+      success_url: backTo + (plan === 'business' ? '?biz=success' : '?pro=success') + '&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: backTo + (plan === 'business' ? '?biz=cancel' : '?pro=cancel')
     });
     res.json({ url: session.url });
   } catch (e) { console.error('create-checkout', e.message); res.status(500).json({ error: e.message }); }
@@ -335,7 +341,10 @@ app.post('/billing/confirm', async (req, res) => {
     if (!paid) return res.json({ ok: false, active: false });
     const md = session.metadata || {};
     if (md.uid && md.uid !== decoded.uid) return res.status(403).json({ error: 'mismatch' });
-    if (md.plan === 'owner') {
+    if (md.plan === 'business') {
+      await adminDb.collection('businesses').doc(decoded.uid).set(
+        { businessTierActive: true, businessTierSince: new Date().toISOString(), businessTierSubId: session.subscription || '' }, { merge: true });
+    } else if (md.plan === 'owner') {
       await adminDb.collection('businesses').doc(decoded.uid).set(
         { proActive: true, proSince: new Date().toISOString(), proSubId: session.subscription || '' }, { merge: true });
     } else {
@@ -364,6 +373,12 @@ app.post('/billing/cancel', async (req, res) => {
       const batch = adminDb.batch();
       g.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }));
       await batch.commit();
+    } else if (plan === 'business') {
+      const ref = adminDb.collection('businesses').doc(decoded.uid);
+      const snap = await ref.get();
+      const subId = snap.exists ? snap.data().businessTierSubId : '';
+      if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+      await ref.set({ businessTierActive: false, businessTierCancelledAt: new Date().toISOString() }, { merge: true });
     } else {
       const ref = adminDb.collection('businesses').doc(decoded.uid);
       const snap = await ref.get();
@@ -402,6 +417,109 @@ app.post('/business/delete', async (req, res) => {
     try { await adminAuth.deleteUser(uid); } catch (e) { console.error('delete auth', e.message); }
     res.json({ ok: true });
   } catch (e) { console.error('business delete', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ---- Multi-location (Business tier) — branches ------------------------------
+// A "head office" on the Business tier runs several branches from one login.
+// Each branch is its own shop doc (own code, staff, tips) owned by the head
+// office via orgOwnerUid. Managed here with the Admin SDK so NO Firestore rules
+// change is needed. Customer + worker flows work unchanged (public reads).
+function genCode(n) { const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let s = ''; for (let i = 0; i < n; i++) s += A[Math.floor(Math.random() * A.length)]; return s; }
+async function uniqueShopCode() {
+  for (let i = 0; i < 8; i++) { const c = genCode(5); const ex = await adminDb.collection('shopCodes').doc(c).get(); if (!ex.exists) return c; }
+  return genCode(7);
+}
+
+// Create a new branch (head office must be on the Business tier).
+app.post('/branch/create', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, name } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const head = await adminDb.collection('businesses').doc(decoded.uid).get();
+    if (!head.exists || head.data().businessTierActive !== true) return res.status(403).json({ error: 'business-tier-required' });
+    const hd = head.data();
+    const branchRef = adminDb.collection('businesses').doc();
+    const code = await uniqueShopCode();
+    await branchRef.set({
+      businessName: String(name || '').trim().slice(0, 80) || ((hd.businessName || 'Shop') + ' — Branch'),
+      currency: hd.currency || 'CAD',
+      country: hd.country || '',
+      logo: hd.logo || '',
+      orgOwnerUid: decoded.uid,
+      isBranch: true,
+      shopCode: code,
+      createdAt: new Date().toISOString()
+    });
+    await adminDb.collection('shopCodes').doc(code).set({ bid: branchRef.id, createdAt: new Date().toISOString() });
+    res.json({ ok: true, id: branchRef.id, shopCode: code });
+  } catch (e) { console.error('branch create', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// List the head office's branches with basic aggregated stats.
+app.post('/branch/list', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    async function statsFor(ref, b, isMain) {
+      let tipCount = 0, tipTotal = 0, ownerShare = 0, staffCount = 0;
+      try { const ts = await ref.collection('tips').get(); ts.forEach(t => { const v = t.data(); tipCount++; tipTotal += (v.tip || 0); ownerShare += (v.ownerShare || 0); }); } catch (_) {}
+      try { const ss = await ref.collection('staff').get(); staffCount = ss.size; } catch (_) {}
+      return { id: ref.id, name: b.businessName || (isMain ? 'Main location' : 'Branch'), isMain: !!isMain, shopCode: b.shopCode || '', currency: b.currency || 'CAD', tipCount, tipTotal, ownerShare, staffCount, createdAt: b.createdAt || '' };
+    }
+    const branches = [];
+    // Head office's own shop is the "main location".
+    const mainRef = adminDb.collection('businesses').doc(decoded.uid);
+    const mainSnap = await mainRef.get();
+    if (mainSnap.exists) branches.push(await statsFor(mainRef, mainSnap.data(), true));
+    const g = await adminDb.collection('businesses').where('orgOwnerUid', '==', decoded.uid).get();
+    for (const d of g.docs) branches.push(await statsFor(d.ref, d.data(), false));
+    branches.sort((a, b) => (a.isMain ? -1 : b.isMain ? 1 : (a.createdAt < b.createdAt ? -1 : 1)));
+    res.json({ ok: true, branches });
+  } catch (e) { console.error('branch list', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Rename a branch (head office only, must own it).
+app.post('/branch/rename', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id, name } = req.body;
+    if (!idToken || !id) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const ref = adminDb.collection('businesses').doc(id);
+    const snap = await ref.get();
+    if (!snap.exists || snap.data().orgOwnerUid !== decoded.uid) return res.status(403).json({ error: 'not-your-branch' });
+    await ref.set({ businessName: String(name || '').trim().slice(0, 80) || 'Branch' }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) { console.error('branch rename', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Delete a branch (head office only). Removes the branch shop, its staff/tips/
+// consents, and its shop code. Workers' own accounts are not touched.
+app.post('/branch/delete', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id } = req.body;
+    if (!idToken || !id) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const ref = adminDb.collection('businesses').doc(id);
+    const snap = await ref.get();
+    if (!snap.exists || snap.data().orgOwnerUid !== decoded.uid) return res.status(403).json({ error: 'not-your-branch' });
+    for (const sub of ['staff', 'tips', 'consents']) {
+      try {
+        const docs = await ref.collection(sub).get();
+        let batch = adminDb.batch(), n = 0;
+        for (const dd of docs.docs) { batch.delete(dd.ref); if (++n >= 400) { await batch.commit(); batch = adminDb.batch(); n = 0; } }
+        if (n > 0) await batch.commit();
+      } catch (e) { console.error('branch delete sub ' + sub, e.message); }
+    }
+    try { const code = snap.data().shopCode; if (code) await adminDb.collection('shopCodes').doc(code).delete(); } catch (_) {}
+    try { await ref.delete(); } catch (e) { console.error('branch delete doc', e.message); }
+    res.json({ ok: true });
+  } catch (e) { console.error('branch delete', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Contact / support form → emails the support inbox (reply-to the sender).

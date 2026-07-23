@@ -149,6 +149,17 @@ app.post('/create-payment-intent', async (req, res) => {
     if (biz.blocked) return res.status(403).json({ error: 'shop-unavailable' });
     const cur = (currency || biz.currency || 'cad').toLowerCase();
 
+    // The owner's administrative fee is a PRO feature. Honor it only when BOTH
+    // (a) the owner turned it on (tipShareEnabled) AND (b) the owning account —
+    // the head office for a branch — is actually on a paid plan right now. This
+    // backend gate protects against a stale tipShareEnabled flag after Pro lapses.
+    let ownerPro = false;
+    try {
+      let od = biz;
+      if (biz.orgOwnerUid) { const os = await adminDb.collection('businesses').doc(biz.orgOwnerUid).get(); od = os.exists ? os.data() : {}; }
+      ownerPro = od.proActive === true || od.businessTierActive === true || od.businessProActive === true || od.ownerAnalyticsEnabled === true;
+    } catch (_) {}
+
     // Station 1: platform commission — a % of the tip PLUS a small fixed fee,
     // both ADDED ON TOP of the tip. The fixed part covers Stripe's fixed
     // per-transaction cost (~$0.30) so even small tips stay profitable
@@ -186,7 +197,7 @@ app.post('/create-payment-intent', async (req, res) => {
     const poolIds = Array.isArray(req.body.poolStaffIds) ? req.body.poolStaffIds.filter(x => typeof x === 'string' && x).slice(0, 50) : [];
     if (biz.tipPoolEnabled === true && req.body.pool === true && poolIds.length) {
       let ownerShare = 0;
-      if (biz.tipShareEnabled === true) { const sp = Math.min(15, Math.max(0, Number(biz.tipSharePercent) || 0)); ownerShare = Math.round(tip * sp / 100); }
+      if (biz.tipShareEnabled === true && ownerPro) { const sp = Math.min(15, Math.max(0, Number(biz.tipSharePercent) || 0)); ownerShare = Math.round(tip * sp / 100); }
       const pi = await stripe.paymentIntents.create({
         amount: total,
         currency: cur,
@@ -265,7 +276,7 @@ app.post('/create-payment-intent', async (req, res) => {
       // owner's connected account after the charge succeeds (/settle-owner-fee).
       // When the fee is off (the default), ownerShare is 0 and nothing changes.
       let ownerShare = 0;
-      if (biz.tipShareEnabled === true) {
+      if (biz.tipShareEnabled === true && ownerPro) {
         const sp = Math.min(15, Math.max(0, Number(biz.tipSharePercent) || 0));
         ownerShare = Math.round(tip * sp / 100);
       }

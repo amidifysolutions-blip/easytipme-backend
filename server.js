@@ -178,6 +178,29 @@ app.post('/create-payment-intent', async (req, res) => {
     const commission = Math.round(tip * commPct / 100) + Math.round(commFixed * 100);  // cents; platform keeps this
     const total = tip + commission;                                                     // customer pays this
 
+    // ---- Tip POOL: the owner splits every tip EQUALLY among the on-shift team ----
+    // Owner-set workplace policy. We take a plain charge here (platform is merchant
+    // of record) and split it among the on-shift, payout-ready workers AFTER the
+    // charge succeeds via /settle-pool (Stripe transfers on the SAME charge) — the
+    // money is divided at source, never moved between workers' settled balances.
+    const poolIds = Array.isArray(req.body.poolStaffIds) ? req.body.poolStaffIds.filter(x => typeof x === 'string' && x).slice(0, 50) : [];
+    if (biz.tipPoolEnabled === true && req.body.pool === true && poolIds.length) {
+      let ownerShare = 0;
+      if (biz.tipShareEnabled === true) { const sp = Math.min(15, Math.max(0, Number(biz.tipSharePercent) || 0)); ownerShare = Math.round(tip * sp / 100); }
+      const pi = await stripe.paymentIntents.create({
+        amount: total,
+        currency: cur,
+        payment_method_types: ['card'],
+        metadata: { businessId, staffId: staffId || '', tip: String(tip), commission: String(commission), commissionPercent: String(commPct), commissionFixed: String(commFixed), ownerShare: String(ownerShare), pool: '1', poolStaffIds: poolIds.join(',') },
+      });
+      return res.json({
+        clientSecret: pi.client_secret,
+        publishableKey: STRIPE_PUBLISHABLE_KEY,
+        breakdown: { tip, commission, total, currency: cur, commissionPercent: commPct, commissionFixed: commFixed, ownerShare, pool: true },
+        held: false, pool: true,
+      });
+    }
+
     const stfSnap = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(staffId).get();
     if (!stfSnap.exists) return res.status(404).json({ error: 'staff-not-found' });
     const staff = stfSnap.data();
@@ -794,6 +817,75 @@ app.post('/settle-owner-fee', async (req, res) => {
       return res.json({ ok: false, error: e.message, held: true });
     }
   } catch (e) { console.error('settle-owner-fee', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Settle a POOLED tip: split the worker portion EQUALLY among the on-shift,
+// payout-ready workers recorded on the charge, via Stripe transfers on the same
+// charge (split at source). Also routes the owner admin fee if any. Idempotent
+// per worker. Called by the tip page right after a pooled payment succeeds.
+app.post('/settle-pool', async (req, res) => {
+  try {
+    if (!adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { paymentId } = req.body;
+    if (!paymentId) return res.status(400).json({ error: 'missing-fields' });
+    const pi = await stripe.paymentIntents.retrieve(paymentId);
+    if (!pi || pi.status !== 'succeeded') return res.json({ ok: false, reason: 'not-succeeded' });
+    const md = pi.metadata || {};
+    if (md.pool !== '1') return res.json({ ok: true, skipped: 'not-pool' });
+    const businessId = md.businessId;
+    const tip = parseInt(md.tip || '0', 10);
+    const ownerShare = parseInt(md.ownerShare || '0', 10);
+    const ids = (md.poolStaffIds || '').split(',').filter(Boolean);
+    if (!businessId || !ids.length) return res.json({ ok: true, transferred: 0 });
+    const poolNet = Math.max(0, tip - ownerShare);
+    // Among the recorded on-shift workers, find those ready to receive.
+    const ready = [];
+    for (const sid of ids) {
+      try {
+        const s = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(sid).get();
+        if (!s.exists) continue;
+        const acct = s.data().connectAccountId;
+        if (!acct) continue;
+        const a = await stripe.accounts.retrieve(acct);
+        if ((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled) ready.push({ sid, acct });
+      } catch (_) {}
+    }
+    let transferred = 0;
+    if (ready.length > 0 && poolNet > 0) {
+      const base = Math.floor(poolNet / ready.length);
+      let rem = poolNet - base * ready.length;   // spread leftover cents across the first few
+      for (const w of ready) {
+        const amt = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--;
+        if (amt <= 0) continue;
+        try {
+          await stripe.transfers.create({
+            amount: amt, currency: pi.currency, destination: w.acct,
+            source_transaction: pi.latest_charge,
+            metadata: { kind: 'pool', businessId, paymentId, staffId: w.sid }
+          }, { idempotencyKey: 'pool_' + paymentId + '_' + w.sid });
+          transferred += amt;
+        } catch (e) { console.error('pool transfer', w.sid, e.message); }
+      }
+    }
+    // Owner administrative fee (same routing as /settle-owner-fee).
+    if (ownerShare > 0) {
+      try {
+        const bizSnap = await adminDb.collection('businesses').doc(businessId).get();
+        const biz = bizSnap.exists ? bizSnap.data() : {};
+        const ownerUid = biz.orgOwnerUid || businessId;
+        let ownerData = biz;
+        if (biz.orgOwnerUid) { const os = await adminDb.collection('businesses').doc(ownerUid).get(); ownerData = os.exists ? os.data() : {}; }
+        const ownerAcct = ownerData.ownerConnectAccountId;
+        if (ownerAcct) {
+          const a = await stripe.accounts.retrieve(ownerAcct);
+          if ((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled) {
+            await stripe.transfers.create({ amount: ownerShare, currency: pi.currency, destination: ownerAcct, source_transaction: pi.latest_charge, metadata: { kind: 'owner-fee', businessId, paymentId } }, { idempotencyKey: 'ownerfee_' + paymentId });
+          }
+        }
+      } catch (e) { console.error('pool owner-fee', e.message); }
+    }
+    return res.json({ ok: true, transferred, split: ready.length, poolNet });
+  } catch (e) { console.error('settle-pool', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Keep a worker's staff records in sync with their real login email. If the

@@ -634,7 +634,7 @@ app.post('/branch/list', async (req, res) => {
     const decoded = await adminAuth.verifyIdToken(idToken);
     async function statsFor(ref, b, isMain) {
       let tipCount = 0, tipTotal = 0, ownerShare = 0, staffCount = 0;
-      try { const ts = await ref.collection('tips').get(); ts.forEach(t => { const v = t.data(); tipCount++; tipTotal += (v.tip || 0); ownerShare += (v.ownerShare || 0); }); } catch (_) {}
+      try { const ts = await ref.collection('tips').get(); ts.forEach(t => { const v = t.data(); if (v.poolHold === true) return; tipCount++; tipTotal += (v.tip || 0); ownerShare += (v.ownerShare || 0); }); } catch (_) {}
       try { const ss = await ref.collection('staff').get(); staffCount = ss.size; } catch (_) {}
       return { id: ref.id, name: b.businessName || (isMain ? 'Main location' : 'Branch'), isMain: !!isMain, shopCode: b.shopCode || '', currency: b.currency || 'CAD', tipCount, tipTotal, ownerShare, staffCount, createdAt: b.createdAt || '' };
     }
@@ -849,33 +849,48 @@ app.post('/settle-pool', async (req, res) => {
     const ids = (md.poolStaffIds || '').split(',').filter(Boolean);
     if (!businessId || !ids.length) return res.json({ ok: true, transferred: 0 });
     const poolNet = Math.max(0, tip - ownerShare);
-    // Among the recorded on-shift workers, find those ready to receive.
-    const ready = [];
-    for (const sid of ids) {
-      try {
-        const s = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(sid).get();
-        if (!s.exists) continue;
-        const acct = s.data().connectAccountId;
-        if (!acct) continue;
-        const a = await stripe.accounts.retrieve(acct);
-        if ((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled) ready.push({ sid, acct });
-      } catch (_) {}
-    }
-    let transferred = 0;
-    if (ready.length > 0 && poolNet > 0) {
-      const base = Math.floor(poolNet / ready.length);
-      let rem = poolNet - base * ready.length;   // spread leftover cents across the first few
-      for (const w of ready) {
-        const amt = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--;
-        if (amt <= 0) continue;
+    // EQUAL split among ALL on-shift workers. A ready worker gets their share
+    // now; a not-yet-connected worker's EQUAL share is HELD (never absorbed by
+    // the others) and released to them by /staff/release-held once they connect.
+    const N = ids.length;
+    let transferred = 0, held = 0;
+    if (N > 0 && poolNet > 0) {
+      const base = Math.floor(poolNet / N);
+      let rem = poolNet - base * N;   // spread leftover cents across the first few
+      for (const sid of ids) {
+        const share = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--;
+        if (share <= 0) continue;
+        let acct = null, ready = false;
         try {
-          await stripe.transfers.create({
-            amount: amt, currency: pi.currency, destination: w.acct,
-            source_transaction: pi.latest_charge,
-            metadata: { kind: 'pool', businessId, paymentId, staffId: w.sid }
-          }, { idempotencyKey: 'pool_' + paymentId + '_' + w.sid });
-          transferred += amt;
-        } catch (e) { console.error('pool transfer', w.sid, e.message); }
+          const s = await adminDb.collection('businesses').doc(businessId).collection('staff').doc(sid).get();
+          if (!s.exists) continue;
+          acct = s.data().connectAccountId || null;
+          if (acct) { const a = await stripe.accounts.retrieve(acct); ready = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled); }
+        } catch (_) {}
+        if (ready && acct) {
+          try {
+            await stripe.transfers.create({
+              amount: share, currency: pi.currency, destination: acct,
+              source_transaction: pi.latest_charge,
+              metadata: { kind: 'pool', businessId, paymentId, staffId: sid }
+            }, { idempotencyKey: 'pool_' + paymentId + '_' + sid });
+            transferred += share;
+          } catch (e) { console.error('pool transfer', sid, e.message); }
+        } else {
+          // Not payout-ready → HOLD this worker's equal share. Deterministic doc
+          // id keeps it idempotent; recipientEmails:[] so it doesn't double-show
+          // (the main pooled tip already shows their share); released later by
+          // /staff/release-held (finds it via staffId, pays staffShare).
+          try {
+            const hid = 'poolhold_' + paymentId + '_' + sid;
+            await adminDb.collection('businesses').doc(businessId).collection('tips').doc(hid).set({
+              staffId: sid, staffShare: share / 100, tip: 0, held: true, released: false, poolHold: true,
+              recipientIds: [sid], recipientEmails: [], currency: pi.currency, paymentId,
+              multiple: false, createdAt: new Date().toISOString()
+            }, { merge: true });
+            held += share;
+          } catch (e) { console.error('pool hold', sid, e.message); }
+        }
       }
     }
     // Owner administrative fee (same routing as /settle-owner-fee).
@@ -895,7 +910,7 @@ app.post('/settle-pool', async (req, res) => {
         }
       } catch (e) { console.error('pool owner-fee', e.message); }
     }
-    return res.json({ ok: true, transferred, split: ready.length, poolNet });
+    return res.json({ ok: true, transferred, held, split: ids.length, poolNet });
   } catch (e) { console.error('settle-pool', e.message); res.status(500).json({ error: e.message }); }
 });
 

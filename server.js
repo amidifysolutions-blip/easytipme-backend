@@ -1759,10 +1759,16 @@ app.post('/connect/create-account', async (req, res) => {
       accountId = snap.exists && snap.data().connectAccountId;
       claimedUid = snap.exists ? snap.data().claimedUid : null;
     }
+    // A remembered account must exist in the CURRENT Stripe mode. After switching
+    // TEST → LIVE keys, an old test account id 404s on live and breaks bank setup
+    // ("No such account"). Verify and drop anything stale so a fresh LIVE account
+    // is created (or the worker's already-live shared account is reused) below.
+    const acctExists = async (id) => { if (!id) return false; try { await connectStripe.accounts.retrieve(id); return true; } catch (e) { console.error('connect stale account', id, e.message); return false; } };
+    if (accountId && !(await acctExists(accountId))) accountId = null;
     // Reuse the worker's existing payout account (one Stripe across all shops).
     if (!accountId && claimedUid) {
       const shared = await getWorkerAccount(claimedUid);
-      if (shared) { accountId = shared; if (ref) await ref.set({ connectAccountId: accountId, connectStatus: 'linked', connectAt: new Date().toISOString() }, { merge: true }); }
+      if (shared && await acctExists(shared)) { accountId = shared; if (ref) await ref.set({ connectAccountId: accountId, connectStatus: 'linked', connectAt: new Date().toISOString() }, { merge: true }); }
     }
     if (!accountId) {
       // Pre-fill what we know so the staff member skips the business/industry questions —

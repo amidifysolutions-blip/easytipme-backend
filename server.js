@@ -1655,15 +1655,39 @@ app.post('/send-reset', async (req, res) => {
 // yet — that is added AFTER Connect is enabled in the dashboard and tested.
 const adminDb = adminAuth ? require('firebase-admin').firestore() : null;
 
+// ---- One Stripe payout account per worker, reused across ALL their workplaces ----
+// The account is remembered under workers/{uid}; every shop's staff doc mirrors it
+// in connectAccountId, so all existing tip/payout code keeps working unchanged.
+async function getWorkerAccount(uid) {
+  if (!uid || !adminDb) return null;
+  try { const w = await adminDb.collection('workers').doc(uid).get(); if (w.exists && w.data().connectAccountId) return w.data().connectAccountId; } catch (_) {}
+  // Backfill from any staff record this worker already connected a bank on.
+  try {
+    const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
+    for (const d of g.docs) { const acct = d.data().connectAccountId; if (acct) { try { await adminDb.collection('workers').doc(uid).set({ connectAccountId: acct, updatedAt: new Date().toISOString() }, { merge: true }); } catch (_) {} return acct; } }
+  } catch (e) { console.error('getWorkerAccount', e.message); }
+  return null;
+}
+async function setWorkerAccount(uid, accountId) {
+  if (!uid || !accountId || !adminDb) return;
+  try { await adminDb.collection('workers').doc(uid).set({ connectAccountId: accountId, updatedAt: new Date().toISOString() }, { merge: true }); } catch (_) {}
+}
+
 app.post('/connect/create-account', async (req, res) => {
   try {
     const { bid, staffId, email, country, firstName, lastName, phone } = req.body;
     if (!bid || !staffId) return res.status(400).json({ error: 'missing bid/staffId' });
-    let accountId = null, ref = null;
+    let accountId = null, ref = null, claimedUid = null;
     if (adminDb) {
       ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
       const snap = await ref.get();
       accountId = snap.exists && snap.data().connectAccountId;
+      claimedUid = snap.exists ? snap.data().claimedUid : null;
+    }
+    // Reuse the worker's existing payout account (one Stripe across all shops).
+    if (!accountId && claimedUid) {
+      const shared = await getWorkerAccount(claimedUid);
+      if (shared) { accountId = shared; if (ref) await ref.set({ connectAccountId: accountId, connectStatus: 'linked', connectAt: new Date().toISOString() }, { merge: true }); }
     }
     if (!accountId) {
       // Pre-fill what we know so the staff member skips the business/industry questions —
@@ -1688,9 +1712,53 @@ app.post('/connect/create-account', async (req, res) => {
       });
       accountId = acct.id;
       if (ref) await ref.set({ connectAccountId: accountId, connectStatus: 'created', connectAt: new Date().toISOString() }, { merge: true });
+      if (claimedUid) await setWorkerAccount(claimedUid, accountId);
     }
     res.json({ accountId });
   } catch (e) { console.error('connect create', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// List every workplace this worker belongs to (for the in-app switcher).
+app.post('/staff/workplaces', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing idToken' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const out = [];
+    const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
+    for (const d of g.docs) {
+      const bizRef = d.ref.parent.parent; if (!bizRef) continue;
+      const sd = d.data();
+      let name = '';
+      try { const b = await bizRef.get(); name = (b.exists && (b.data().businessName || '')) || ''; } catch (_) {}
+      out.push({ bid: bizRef.id, staffId: d.id, name, role: sd.job || '', nickname: sd.nickname || '', left: sd.leftByStaff === true, removed: sd.status === 'removed' });
+    }
+    res.json({ ok: true, workplaces: out });
+  } catch (e) { console.error('workplaces', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Link the worker's shared payout account into the current shop's staff doc, so
+// they get paid here without re-connecting a bank. Called when the app loads a shop.
+app.post('/staff/link-payout', async (req, res) => {
+  try {
+    const { idToken, bid, staffId } = req.body;
+    if (!idToken || !bid || !staffId) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.json({ ok: true, linked: false });
+    const sd = snap.data();
+    if (sd.claimedUid && sd.claimedUid !== uid) return res.status(403).json({ error: 'not-your-record' });
+    // Already has one here → make sure it's remembered as the worker's shared account.
+    if (sd.connectAccountId) { await setWorkerAccount(uid, sd.connectAccountId); return res.json({ ok: true, linked: false, already: true, accountId: sd.connectAccountId }); }
+    const shared = await getWorkerAccount(uid);
+    if (shared) { await ref.set({ connectAccountId: shared, connectStatus: 'linked', connectAt: new Date().toISOString() }, { merge: true }); return res.json({ ok: true, linked: true, accountId: shared }); }
+    res.json({ ok: true, linked: false });
+  } catch (e) { console.error('link-payout', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post('/connect/onboarding-link', async (req, res) => {

@@ -1820,6 +1820,81 @@ app.post('/staff/release-held', async (req, res) => {
   } catch (e) { console.error('release-held', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Worker permanently deletes THEIR OWN account: removed from EVERY workplace
+// (stops appearing on all tip pages, login link severed), their Stripe payout
+// account is deleted, and their Firebase login is removed so the email is freed.
+// Before anything is removed we try to pay out any held money that's payable.
+// The client re-authenticates (password) before calling. Idempotent-safe.
+app.post('/staff/delete-account', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ error: 'missing idToken' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const FieldValue = require('firebase-admin').firestore.FieldValue;
+
+    // Every staff record this worker owns, across all workplaces.
+    const staffDocs = [];
+    try {
+      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
+      g.forEach(d => staffDocs.push(d));
+    } catch (e) { console.error('delete-account staff lookup', e.message); }
+
+    const acctIds = new Set();
+    let workplaces = 0, released = 0, releasedCents = 0, heldUnpaid = 0, heldUnpaidCents = 0, currency = null;
+
+    for (const sd of staffDocs) {
+      const staff = sd.data();
+      const staffId = sd.id;
+      const bizRef = sd.ref.parent.parent; // businesses/{bid}
+      const acctId = staff.connectAccountId;
+      let ready = false;
+      if (acctId) {
+        try { const a = await stripe.accounts.retrieve(acctId); ready = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled); } catch (_) { ready = false; }
+      }
+      // Pay out any held shares we still can before severing the account.
+      if (bizRef) {
+        let tipsSnap = null;
+        try { tipsSnap = await bizRef.collection('tips').where('staffId', '==', staffId).get(); } catch (_) {}
+        if (tipsSnap) for (const t of tipsSnap.docs) {
+          const td = t.data();
+          if (td.held !== true || td.released === true) continue;
+          const owed = Math.round(Number(td.staffShare != null ? td.staffShare : td.tip) * 100);
+          const cur = (td.currency || 'cad').toLowerCase();
+          if (!(owed > 0)) { try { await t.ref.update({ released: true, releasedAt: new Date().toISOString(), releaseNote: 'zero-amount' }); } catch (_) {} continue; }
+          if (!ready) { heldUnpaid++; heldUnpaidCents += owed; currency = cur; continue; }
+          try {
+            const tr = await stripe.transfers.create({ amount: owed, currency: cur, destination: acctId, metadata: { kind: 'held-release-selfdelete', businessId: bizRef.id, staffId, tipId: t.id } }, { idempotencyKey: 'release_' + t.id });
+            try { await t.ref.update({ released: true, releasedAt: new Date().toISOString(), transferId: tr.id }); } catch (_) {}
+            released++; releasedCents += owed; currency = cur;
+          } catch (e) { heldUnpaid++; heldUnpaidCents += owed; currency = cur; console.error('delete-account release', t.id, e.message); }
+        }
+      }
+      if (acctId) acctIds.add(acctId);
+      // Remove from this workplace: stop appearing, unclaim (frees re-invite),
+      // drop the (soon-deleted) payout account reference.
+      try {
+        await sd.ref.update({ leftByStaff: true, leftAt: FieldValue.serverTimestamp(), accountDeleted: true, claimedUid: FieldValue.delete(), connectAccountId: FieldValue.delete() });
+        workplaces++;
+      } catch (e) { console.error('delete-account staff update', e.message); }
+    }
+
+    // Delete the worker's Stripe payout account(s). Best-effort — Stripe blocks
+    // deletion if a balance is still owed, which protects any un-paid money.
+    let stripeDeleted = 0;
+    for (const acctId of acctIds) {
+      try { await connectStripe.accounts.del(acctId); stripeDeleted++; } catch (e) { console.error('delete-account stripe del', acctId, e.message); }
+    }
+
+    // Free the login email.
+    let authDeleted = false;
+    try { await adminAuth.deleteUser(uid); authDeleted = true; } catch (e) { console.error('delete-account auth', e.message); }
+
+    res.json({ ok: true, workplaces, released, releasedAmount: releasedCents / 100, heldUnpaid, heldUnpaidAmount: heldUnpaidCents / 100, stripeDeleted, authDeleted, currency });
+  } catch (e) { console.error('delete-account', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Owner (business) connects THEIR OWN payout account — destination for their
 // admin fee (and, in the collect model, the whole pool). Verified against the
 // owner's ID token (uid must equal the business id).

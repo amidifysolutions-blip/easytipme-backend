@@ -622,6 +622,36 @@ app.post('/admin/delete-business', async (req, res) => {
   } catch (e) { console.error('admin delete-business', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Admin-only: free an email — delete its leftover Firebase login (and any orphaned
+// business data still under it) so it can register again. Fixes "email already
+// registered" after a test shop was removed.
+app.post('/admin/free-email', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, email } = req.body;
+    if (!idToken || !email) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const ADMIN = (process.env.ADMIN_EMAIL || 'amidifysolutions@gmail.com').toLowerCase();
+    if ((decoded.email || '').toLowerCase() !== ADMIN) return res.status(403).json({ error: 'not-admin' });
+    const target = String(email).trim().toLowerCase();
+    let user;
+    try { user = await adminAuth.getUserByEmail(target); } catch (e) { return res.json({ ok: false, error: 'no-such-user' }); }
+    const uid = user.uid;
+    // Clean any orphaned business data still under this uid, then free the login.
+    try {
+      const ref = adminDb.collection('businesses').doc(uid);
+      const s = await ref.get();
+      if (s.exists) {
+        for (const sub of ['staff', 'tips', 'consents']) { try { const docs = await ref.collection(sub).get(); let b = adminDb.batch(), n = 0; for (const dd of docs.docs) { b.delete(dd.ref); if (++n >= 400) { await b.commit(); b = adminDb.batch(); n = 0; } } if (n > 0) await b.commit(); } catch (_) {} }
+        try { const code = s.data().shopCode; if (code) await adminDb.collection('shopCodes').doc(code).delete(); } catch (_) {}
+        try { await ref.delete(); } catch (_) {}
+      }
+    } catch (_) {}
+    await adminAuth.deleteUser(uid);
+    res.json({ ok: true, freed: target });
+  } catch (e) { console.error('free-email', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ---- Multi-location (Business tier) — branches ------------------------------
 // A "head office" on the Business tier runs several branches from one login.
 // Each branch is its own shop doc (own code, staff, tips) owned by the head

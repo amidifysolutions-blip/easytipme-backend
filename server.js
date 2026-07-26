@@ -583,6 +583,45 @@ app.post('/business/delete', async (req, res) => {
   } catch (e) { console.error('business delete', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Admin-only: FULLY delete any business — Firestore doc + subcollections +
+// branches + shop codes + subscriptions + the Firebase Auth login — so the
+// owner's email is freed for reuse. Called from the admin control room. Verifies
+// the caller is the platform admin (so no one else can wipe a shop).
+app.post('/admin/delete-business', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, uid } = req.body;
+    if (!idToken || !uid) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const ADMIN = (process.env.ADMIN_EMAIL || 'amidifysolutions@gmail.com').toLowerCase();
+    if ((decoded.email || '').toLowerCase() !== ADMIN) return res.status(403).json({ error: 'not-admin' });
+    const ref = adminDb.collection('businesses').doc(uid);
+    const snap = await ref.get();
+    if (snap.exists) {
+      const d = snap.data();
+      for (const k of ['proSubId', 'businessTierSubId', 'businessProSubId']) { if (d[k]) { try { await stripe.subscriptions.cancel(d[k]); } catch (_) {} } }
+    }
+    // Branches owned by this head office (their staff/tips/consents/code/doc).
+    try {
+      const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
+      for (const br of brs.docs) {
+        for (const sub of ['staff', 'tips', 'consents']) { try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {} }
+        try { const c = br.data().shopCode; if (c) await adminDb.collection('shopCodes').doc(c).delete(); } catch (_) {}
+        try { await br.ref.delete(); } catch (_) {}
+      }
+    } catch (e) { console.error('admin delete branches', e.message); }
+    for (const sub of ['staff', 'tips', 'consents']) {
+      try { const docs = await ref.collection(sub).get(); let batch = adminDb.batch(), n = 0; for (const dd of docs.docs) { batch.delete(dd.ref); if (++n >= 400) { await batch.commit(); batch = adminDb.batch(); n = 0; } } if (n > 0) await batch.commit(); } catch (e) { console.error('admin delete sub ' + sub, e.message); }
+    }
+    try { const codes = await adminDb.collection('shopCodes').where('bid', '==', uid).get(); const b = adminDb.batch(); codes.forEach(d => b.delete(d.ref)); await b.commit(); } catch (_) {}
+    try { await ref.delete(); } catch (e) { console.error('admin delete biz doc', e.message); }
+    // Free the login email (doc id == owner's Firebase uid). Fails harmlessly for a branch id.
+    let authDeleted = false;
+    try { await adminAuth.deleteUser(uid); authDeleted = true; } catch (e) { console.error('admin delete auth', e.message); }
+    res.json({ ok: true, authDeleted });
+  } catch (e) { console.error('admin delete-business', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ---- Multi-location (Business tier) — branches ------------------------------
 // A "head office" on the Business tier runs several branches from one login.
 // Each branch is its own shop doc (own code, staff, tips) owned by the head

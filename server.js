@@ -1432,10 +1432,9 @@ app.post('/staff/activate', async (req, res) => {
   } catch (e) { console.error('staff activate', e.message); res.status(500).json({ error: e.message }); }
 });
 
-// Owner FULLY deletes a staff member: removes the Firestore record AND the
-// worker's Firebase login account — but ONLY if that account isn't the owner's
-// own account and isn't linked to another workplace. Verified against the
-// owner's ID token (uid must equal the business id).
+// Owner removes a worker from THEIR shop. This deletes only the staff record at
+// this shop (public + private) — never the worker's own login/account. Verified
+// against the owner's ID token (uid must equal the business id).
 app.post('/staff/delete', async (req, res) => {
   try {
     const { idToken, bid, staffId } = req.body;
@@ -1443,30 +1442,16 @@ app.post('/staff/delete', async (req, res) => {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    // Owner removes this worker from THEIR shop ONLY: delete the staff record
+    // (public doc + its private half). We NEVER delete the worker's own login /
+    // account — that is theirs alone to delete from their own app. Their EasyTipMe
+    // account and any OTHER workplaces stay intact; their past tips stay recorded
+    // in this shop's reports. (A worker with no workplace left just sees the
+    // "not connected to a workplace" screen and can join a new one.)
     const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
-    const snap = await ref.get();
-    const claimedUid = snap.exists ? (snap.data().claimedUid || null) : null;
-    // 1) remove the staff record for this shop (public doc + its private half)
     await ref.delete();
     try { await adminDb.collection('businesses').doc(bid).collection('staffPrivate').doc(staffId).delete(); } catch (_) {}
-    // 2) decide whether the login account can be fully removed
-    let authDeleted = false;
-    if (claimedUid && claimedUid !== bid) {
-      let usedElsewhere = false;
-      try {
-        // any OTHER staff doc (in any shop) still linked to this account?
-        const others = await adminDb.collectionGroup('staff').where('claimedUid', '==', claimedUid).limit(1).get();
-        usedElsewhere = !others.empty; // we already deleted this shop's doc, so any match = another workplace
-      } catch (_) { usedElsewhere = false; } // no index/err → current single-workplace model, safe to remove
-      // never delete an account that is itself a business owner
-      let isOwner = false;
-      try { const b = await adminDb.collection('businesses').doc(claimedUid).get(); isOwner = b.exists; } catch (_) {}
-      if (!usedElsewhere && !isOwner) {
-        try { await adminAuth.deleteUser(claimedUid); authDeleted = true; } catch (e) { console.error('deleteUser', e.message); }
-        try { await adminDb.collection('emailCodes').doc(claimedUid).delete(); } catch (_) {}
-      }
-    }
-    res.json({ ok: true, authDeleted });
+    res.json({ ok: true });
   } catch (e) { console.error('staff delete', e.message); res.status(500).json({ error: e.message }); }
 });
 

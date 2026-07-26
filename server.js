@@ -1726,14 +1726,22 @@ app.post('/staff/workplaces', async (req, res) => {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     const uid = decoded.uid;
+    // Collect candidate workplace ids: from the worker doc (index-free, primary)
+    // and, as a bonus, a collection-group query (works only if that index exists).
+    const bidMap = new Map(); // bid -> staffId (hint)
+    try { const w = await adminDb.collection('workers').doc(uid).get(); const shops = (w.exists && w.data().shops) || {}; Object.keys(shops).forEach(bid => bidMap.set(bid, (shops[bid] && shops[bid].staffId) || null)); } catch (_) {}
+    try { const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get(); g.forEach(d => { const b = d.ref.parent.parent; if (b) bidMap.set(b.id, d.id); }); } catch (_) {}
     const out = [];
-    const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
-    for (const d of g.docs) {
-      const bizRef = d.ref.parent.parent; if (!bizRef) continue;
-      const sd = d.data();
-      let name = '';
-      try { const b = await bizRef.get(); name = (b.exists && (b.data().businessName || '')) || ''; } catch (_) {}
-      out.push({ bid: bizRef.id, staffId: d.id, name, role: sd.job || '', nickname: sd.nickname || '', left: sd.leftByStaff === true, removed: sd.status === 'removed' });
+    for (const [bid, hintId] of bidMap) {
+      try {
+        const bref = adminDb.collection('businesses').doc(bid);
+        const b = await bref.get(); if (!b.exists) continue;
+        let sid = hintId, sd = null;
+        if (sid) { const s = await bref.collection('staff').doc(sid).get(); if (s.exists) sd = s.data(); }
+        if (!sd) { const q = await bref.collection('staff').where('claimedUid', '==', uid).limit(1).get(); if (!q.empty) { sid = q.docs[0].id; sd = q.docs[0].data(); } }
+        if (!sd) continue;
+        out.push({ bid, staffId: sid, name: b.data().businessName || '', role: sd.job || '', nickname: sd.nickname || '', left: sd.leftByStaff === true, removed: sd.status === 'removed' });
+      } catch (_) {}
     }
     res.json({ ok: true, workplaces: out });
   } catch (e) { console.error('workplaces', e.message); res.status(500).json({ error: e.message }); }
@@ -1753,6 +1761,9 @@ app.post('/staff/link-payout', async (req, res) => {
     if (!snap.exists) return res.json({ ok: true, linked: false });
     const sd = snap.data();
     if (sd.claimedUid && sd.claimedUid !== uid) return res.status(403).json({ error: 'not-your-record' });
+    // Remember this workplace under the worker so the in-app switcher can list it
+    // without needing a collection-group index.
+    try { await adminDb.collection('workers').doc(uid).set({ shops: { [bid]: { staffId, at: new Date().toISOString() } } }, { merge: true }); } catch (_) {}
     // Already has one here → make sure it's remembered as the worker's shared account.
     if (sd.connectAccountId) { await setWorkerAccount(uid, sd.connectAccountId); return res.json({ ok: true, linked: false, already: true, accountId: sd.connectAccountId }); }
     const shared = await getWorkerAccount(uid);

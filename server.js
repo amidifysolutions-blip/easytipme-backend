@@ -1729,6 +1729,31 @@ async function setWorkerAccount(uid, accountId) {
   if (!uid || !accountId || !adminDb) return;
   try { await adminDb.collection('workers').doc(uid).set({ connectAccountId: accountId, updatedAt: new Date().toISOString() }, { merge: true }); } catch (_) {}
 }
+// Find EVERY staff record a worker owns — INDEX-FREE. Primary source is the
+// worker doc's `shops` map (always present, no composite index needed); for each
+// shop we query that ONE collection by claimedUid (single-field index, automatic).
+// A collection-group query is added only as a bonus (works only if that index
+// exists). This is what makes delete-account / release-held reliable even when the
+// collection-group index isn't enabled — the old code silently found nothing.
+async function workerStaffDocs(uid) {
+  const found = new Map(); // ref.path -> snapshot
+  if (!uid || !adminDb) return [];
+  try {
+    const w = await adminDb.collection('workers').doc(uid).get();
+    const shops = (w.exists && w.data().shops) || {};
+    for (const bid of Object.keys(shops)) {
+      try {
+        const q = await adminDb.collection('businesses').doc(bid).collection('staff').where('claimedUid', '==', uid).get();
+        q.forEach(d => found.set(d.ref.path, d));
+      } catch (_) {}
+    }
+  } catch (_) {}
+  try {
+    const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
+    g.forEach(d => found.set(d.ref.path, d));
+  } catch (_) {}
+  return Array.from(found.values());
+}
 
 app.post('/connect/create-account', async (req, res) => {
   try {
@@ -1910,12 +1935,9 @@ app.post('/staff/release-held', async (req, res) => {
     const decoded = await adminAuth.verifyIdToken(idToken);
     const uid = decoded.uid;
 
-    // Every staff record this worker owns (invited workers are linked by claimedUid).
-    const staffDocs = [];
-    try {
-      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
-      g.forEach(d => staffDocs.push(d));
-    } catch (e) { console.error('release-held staff lookup', e.message); }
+    // Every staff record this worker owns (index-free; not dependent on the
+    // collection-group index).
+    const staffDocs = await workerStaffDocs(uid);
 
     let released = 0, totalCents = 0, currency = null;
     for (const sd of staffDocs) {
@@ -1969,12 +1991,11 @@ app.post('/staff/delete-account', async (req, res) => {
     const decoded = await adminAuth.verifyIdToken(idToken);
     const uid = decoded.uid;
 
-    // Every staff record this worker owns, across all workplaces.
-    const staffDocs = [];
-    try {
-      const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get();
-      g.forEach(d => staffDocs.push(d));
-    } catch (e) { console.error('delete-account staff lookup', e.message); }
+    // Every staff record this worker owns, across all workplaces (index-free —
+    // works even when the collection-group index isn't enabled, which was the bug:
+    // the old collectionGroup-only lookup silently found nothing and left the
+    // worker sitting in the owner's dashboard).
+    const staffDocs = await workerStaffDocs(uid);
 
     const acctIds = new Set();
     let workplaces = 0, released = 0, releasedCents = 0, heldUnpaid = 0, heldUnpaidCents = 0, currency = null;
@@ -2024,6 +2045,9 @@ app.post('/staff/delete-account', async (req, res) => {
     for (const acctId of acctIds) {
       try { await connectStripe.accounts.del(acctId); stripeDeleted++; } catch (e) { console.error('delete-account stripe del', acctId, e.message); }
     }
+
+    // Remove the shared worker doc (payout mapping + shops list) so nothing is left behind.
+    try { await adminDb.collection('workers').doc(uid).delete(); } catch (_) {}
 
     // Free the login email.
     let authDeleted = false;

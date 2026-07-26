@@ -1808,6 +1808,7 @@ app.post('/staff/workplaces', async (req, res) => {
     try { const w = await adminDb.collection('workers').doc(uid).get(); if (w.exists) { const wd = w.data() || {}; workerPro = wd.workerProActive === true; const shops = wd.shops || {}; Object.keys(shops).forEach(bid => bidMap.set(bid, (shops[bid] && shops[bid].staffId) || null)); } } catch (_) {}
     try { const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get(); g.forEach(d => { const b = d.ref.parent.parent; if (b) bidMap.set(b.id, d.id); }); } catch (_) {}
     const out = [];
+    let foundStaffPro = false, healSub = '', healSince = '';
     for (const [bid, hintId] of bidMap) {
       try {
         const bref = adminDb.collection('businesses').doc(bid);
@@ -1816,8 +1817,18 @@ app.post('/staff/workplaces', async (req, res) => {
         if (sid) { const s = await bref.collection('staff').doc(sid).get(); if (s.exists) sd = s.data(); }
         if (!sd) { const q = await bref.collection('staff').where('claimedUid', '==', uid).limit(1).get(); if (!q.empty) { sid = q.docs[0].id; sd = q.docs[0].data(); } }
         if (!sd) continue;
+        // Remember a Pro flag mirrored onto a shop record, so a legacy subscriber
+        // (who paid before Pro moved to their account) can be healed just below.
+        if (sd.workerProActive === true) { foundStaffPro = true; if (!healSub) healSub = sd.workerProSubId || ''; if (!healSince) healSince = sd.workerProSince || ''; }
         out.push({ bid, staffId: sid, name: b.data().businessName || '', role: sd.job || '', nickname: sd.nickname || '', left: sd.leftByStaff === true, removed: sd.status === 'removed' });
       } catch (_) {}
+    }
+    // Self-heal: worker's OWN account isn't flagged Pro but a shop record is →
+    // promote it onto workers/{uid} so Pro shows in EVERY workplace and survives
+    // owner-delete. One-time; from now on the account is the source of truth.
+    if (!workerPro && foundStaffPro) {
+      workerPro = true;
+      try { await adminDb.collection('workers').doc(uid).set({ workerProActive: true, workerProSubId: healSub || '', workerProSince: healSince || new Date().toISOString() }, { merge: true }); } catch (e) { console.error('workplaces heal', e.message); }
     }
     res.json({ ok: true, workplaces: out, pro: workerPro });
   } catch (e) { console.error('workplaces', e.message); res.status(500).json({ error: e.message }); }

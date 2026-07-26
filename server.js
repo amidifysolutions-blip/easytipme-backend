@@ -2084,6 +2084,9 @@ app.post('/connect/create-owner-account', async (req, res) => {
     const ref = adminDb.collection('businesses').doc(bid);
     const snap = await ref.get();
     let accountId = snap.exists && snap.data().ownerConnectAccountId;
+    // Drop a stale account id (e.g. a TEST account after switching to LIVE keys)
+    // so a fresh live account gets created instead of failing bank setup.
+    if (accountId) { try { await connectStripe.accounts.retrieve(accountId); } catch (e) { console.error('owner stale account -> recreate', accountId, e.message); accountId = null; } }
     if (!accountId) {
       const acct = await connectStripe.accounts.create({
         type: 'express',

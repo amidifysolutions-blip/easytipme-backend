@@ -1470,6 +1470,44 @@ app.post('/staff/delete', async (req, res) => {
   } catch (e) { console.error('staff delete', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// Notify a workplace owner (by email) that one of their workers just left the team.
+// Called by the worker app right after 'Leave workplace'. Best-effort, non-blocking.
+app.post('/staff/notify-leave', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid, staffId } = req.body;
+    if (!idToken || !bid || !staffId) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const uid = decoded.uid;
+    const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    // Confirm the staff record really belongs to the caller (claimed by them).
+    const sref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    const ssnap = await sref.get();
+    if (!ssnap.exists) return res.json({ sent: 0, error: 'no-staff' });
+    const staff = ssnap.data();
+    if (staff.claimedUid && staff.claimedUid !== uid) return res.status(403).json({ error: 'not-your-record' });
+    const worker = staff.nickname || 'A team member';
+    // Business name + owner email (business doc, else the owner's auth email).
+    const bsnap = await adminDb.collection('businesses').doc(bid).get();
+    const biz = bsnap.exists ? bsnap.data() : {};
+    const shopName = biz.businessName || 'your workplace';
+    let ownerEmail = biz.email || '';
+    if (!ownerEmail) { try { const ow = await adminAuth.getUser(bid); ownerEmail = ow.email || ''; } catch (_) {} }
+    if (!ownerEmail) return res.json({ sent: 0, error: 'no-owner-email' });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (apiKey) {
+      const html = `<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:auto;color:#1d1d1f;line-height:1.55"><h2 style="color:#0071e3;margin:0 0 12px">EasyTipMe</h2><p><b>${esc(worker)}</b> has left your team at <b>${esc(shopName)}</b>.</p><p>They no longer appear on your tip page. Their past tip history stays in your records, and you can add them again anytime from your dashboard.</p><p style="color:#6e6e73;font-size:12px;margin-top:22px">Amidify Solutions Inc.</p></div>`;
+      await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: ownerEmail }], subject: `${worker} left your team on EasyTipMe`, htmlContent: html })
+      });
+    }
+    res.json({ sent: 1 });
+  } catch (e) { console.error('staff notify-leave', e.message); res.json({ sent: 0, error: e.message }); }
+});
+
 // Business owner changes their own login email. Their Stripe payout account is
 // linked by account id (not email), so the connection stays intact. Verified
 // against the owner's ID token (uid must equal the business id).

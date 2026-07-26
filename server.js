@@ -1832,7 +1832,6 @@ app.post('/staff/delete-account', async (req, res) => {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     const uid = decoded.uid;
-    const FieldValue = require('firebase-admin').firestore.FieldValue;
 
     // Every staff record this worker owns, across all workplaces.
     const staffDocs = [];
@@ -1872,12 +1871,14 @@ app.post('/staff/delete-account', async (req, res) => {
         }
       }
       if (acctId) acctIds.add(acctId);
-      // Remove from this workplace: stop appearing, unclaim (frees re-invite),
-      // drop the (soon-deleted) payout account reference.
+      // Full account deletion → remove the worker from this workplace's roster
+      // entirely (not just marked "left"), so the email is truly free to sign up
+      // fresh again later. Past tip records stay under the business (separate
+      // subcollection) so the owner keeps their history and commission.
       try {
-        await sd.ref.update({ leftByStaff: true, leftAt: FieldValue.serverTimestamp(), accountDeleted: true, claimedUid: FieldValue.delete(), connectAccountId: FieldValue.delete() });
+        await sd.ref.delete();
         workplaces++;
-      } catch (e) { console.error('delete-account staff update', e.message); }
+      } catch (e) { console.error('delete-account staff delete', e.message); }
     }
 
     // Delete the worker's Stripe payout account(s). Best-effort — Stripe blocks

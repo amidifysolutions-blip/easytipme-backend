@@ -508,6 +508,48 @@ function deleteCodeHtml(code) {
     <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:10px 0 0;">This code expires in 15 minutes. If you didn't request this, ignore this email — your account stays exactly as it is.</p>
   </div>`);
 }
+// Before a business is wiped, pay out any money that was HELD for its workers
+// (pool shares kept back while a worker hadn't finished connecting their bank).
+// For each staff with a ready Connect account, transfer their held+unreleased
+// shares so nothing is silently deleted. Idempotent per tip (release_<tipId>).
+// Held shares for workers who never connected simply can't be paid and are
+// reported back so the caller/admin knows. Never throws — deletion continues.
+async function releaseHeldForBusiness(bizRef) {
+  const out = { released: 0, amountCents: 0, unpaidHeld: 0, unpaidCents: 0, currency: null };
+  try {
+    const staffSnap = await bizRef.collection('staff').get();
+    for (const sd of staffSnap.docs) {
+      const staff = sd.data();
+      const staffId = sd.id;
+      const acctId = staff.connectAccountId;
+      let ready = false;
+      if (acctId) {
+        try { const a = await stripe.accounts.retrieve(acctId); ready = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled); } catch (_) { ready = false; }
+      }
+      let tipsSnap;
+      try { tipsSnap = await bizRef.collection('tips').where('staffId', '==', staffId).get(); }
+      catch (e) { console.error('release-before-delete tips query', e.message); continue; }
+      for (const t of tipsSnap.docs) {
+        const td = t.data();
+        if (td.held !== true || td.released === true) continue;
+        const owed = Math.round(Number(td.staffShare != null ? td.staffShare : td.tip) * 100);
+        const cur = (td.currency || 'cad').toLowerCase();
+        if (!(owed > 0)) { try { await t.ref.update({ released: true, releasedAt: new Date().toISOString(), releaseNote: 'zero-amount' }); } catch (_) {} continue; }
+        if (!ready) { out.unpaidHeld++; out.unpaidCents += owed; out.currency = cur; continue; }
+        try {
+          const tr = await stripe.transfers.create({
+            amount: owed, currency: cur, destination: acctId,
+            metadata: { kind: 'held-release-predelete', businessId: bizRef.id, staffId, tipId: t.id }
+          }, { idempotencyKey: 'release_' + t.id });
+          try { await t.ref.update({ released: true, releasedAt: new Date().toISOString(), transferId: tr.id }); } catch (_) {}
+          out.released++; out.amountCents += owed; out.currency = cur;
+        } catch (e) { out.unpaidHeld++; out.unpaidCents += owed; out.currency = cur; console.error('release-before-delete transfer', t.id, e.message); }
+      }
+    }
+  } catch (e) { console.error('releaseHeldForBusiness', e.message); }
+  return out;
+}
+
 app.post('/business/delete-request', async (req, res) => {
   try {
     if (!adminAuth || !adminDb) return res.json({ sent: 0, error: 'admin-not-configured' });
@@ -557,10 +599,16 @@ app.post('/business/delete', async (req, res) => {
     if (snap.exists && snap.data().proSubId) { try { await stripe.subscriptions.cancel(snap.data().proSubId); } catch (_) {} }
     if (snap.exists && snap.data().businessTierSubId) { try { await stripe.subscriptions.cancel(snap.data().businessTierSubId); } catch (_) {} }
     if (snap.exists && snap.data().businessProSubId) { try { await stripe.subscriptions.cancel(snap.data().businessProSubId); } catch (_) {} }
+    // Clean deletion: pay out any held worker money first, so nothing is wiped
+    // while a worker is still owed a pool share.
+    const heldReport = { released: 0, amountCents: 0, unpaidHeld: 0, unpaidCents: 0, currency: null };
+    function mergeHeld(r) { heldReport.released += r.released; heldReport.amountCents += r.amountCents; heldReport.unpaidHeld += r.unpaidHeld; heldReport.unpaidCents += r.unpaidCents; if (r.currency) heldReport.currency = r.currency; }
+    try { mergeHeld(await releaseHeldForBusiness(ref)); } catch (_) {}
     // Delete any branches this head office owns (their staff/tips/consents/code).
     try {
       const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
       for (const br of brs.docs) {
+        try { mergeHeld(await releaseHeldForBusiness(br.ref)); } catch (_) {}
         for (const sub of ['staff', 'tips', 'consents']) {
           try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {}
         }
@@ -579,7 +627,7 @@ app.post('/business/delete', async (req, res) => {
     try { const codes = await adminDb.collection('shopCodes').where('bid', '==', uid).get(); const b = adminDb.batch(); codes.forEach(d => b.delete(d.ref)); await b.commit(); } catch (_) {}
     try { await ref.delete(); } catch (e) { console.error('delete biz doc', e.message); }
     try { await adminAuth.deleteUser(uid); } catch (e) { console.error('delete auth', e.message); }
-    res.json({ ok: true });
+    res.json({ ok: true, heldReleased: heldReport.released, heldAmount: heldReport.amountCents / 100, heldUnpaid: heldReport.unpaidHeld, heldUnpaidAmount: heldReport.unpaidCents / 100, currency: heldReport.currency });
   } catch (e) { console.error('business delete', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -601,10 +649,15 @@ app.post('/admin/delete-business', async (req, res) => {
       const d = snap.data();
       for (const k of ['proSubId', 'businessTierSubId', 'businessProSubId']) { if (d[k]) { try { await stripe.subscriptions.cancel(d[k]); } catch (_) {} } }
     }
+    // Clean deletion: pay out held worker money before anything is wiped.
+    const heldReport = { released: 0, amountCents: 0, unpaidHeld: 0, unpaidCents: 0, currency: null };
+    function mergeHeld(r) { heldReport.released += r.released; heldReport.amountCents += r.amountCents; heldReport.unpaidHeld += r.unpaidHeld; heldReport.unpaidCents += r.unpaidCents; if (r.currency) heldReport.currency = r.currency; }
+    try { mergeHeld(await releaseHeldForBusiness(ref)); } catch (_) {}
     // Branches owned by this head office (their staff/tips/consents/code/doc).
     try {
       const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
       for (const br of brs.docs) {
+        try { mergeHeld(await releaseHeldForBusiness(br.ref)); } catch (_) {}
         for (const sub of ['staff', 'tips', 'consents']) { try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {} }
         try { const c = br.data().shopCode; if (c) await adminDb.collection('shopCodes').doc(c).delete(); } catch (_) {}
         try { await br.ref.delete(); } catch (_) {}
@@ -618,7 +671,7 @@ app.post('/admin/delete-business', async (req, res) => {
     // Free the login email (doc id == owner's Firebase uid). Fails harmlessly for a branch id.
     let authDeleted = false;
     try { await adminAuth.deleteUser(uid); authDeleted = true; } catch (e) { console.error('admin delete auth', e.message); }
-    res.json({ ok: true, authDeleted });
+    res.json({ ok: true, authDeleted, heldReleased: heldReport.released, heldAmount: heldReport.amountCents / 100, heldUnpaid: heldReport.unpaidHeld, heldUnpaidAmount: heldReport.unpaidCents / 100, currency: heldReport.currency });
   } catch (e) { console.error('admin delete-business', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1794,6 +1847,38 @@ app.post('/connect/create-owner-account', async (req, res) => {
     }
     res.json({ accountId });
   } catch (e) { console.error('connect owner create', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Owner opens their OWN Stripe Express dashboard (see balance, payouts, edit
+// bank details). Returns a one-time login link for the owner's connected
+// account. Owner-authenticated (uid must match the business). If Express
+// dashboard access isn't enabled yet, falls back to an onboarding account link
+// so they can finish setup, then get a dashboard.
+app.post('/connect/owner-dashboard-link', async (req, res) => {
+  try {
+    const { idToken, bid, returnUrl } = req.body;
+    if (!idToken || !bid) return res.status(400).json({ error: 'missing fields' });
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (decoded.uid !== bid) return res.status(403).json({ error: 'not-your-business' });
+    const snap = await adminDb.collection('businesses').doc(bid).get();
+    const acctId = snap.exists && snap.data().ownerConnectAccountId;
+    if (!acctId) return res.status(400).json({ error: 'no-account' });
+    try {
+      const link = await connectStripe.accounts.createLoginLink(acctId);
+      return res.json({ url: link.url, kind: 'dashboard' });
+    } catch (e) {
+      // Account not fully onboarded yet → give an onboarding link instead.
+      try {
+        const base = (returnUrl || 'https://www.easytipme.com/dashboard.html');
+        const al = await connectStripe.accountLinks.create({
+          account: acctId, type: 'account_onboarding',
+          refresh_url: base, return_url: base
+        });
+        return res.json({ url: al.url, kind: 'onboarding' });
+      } catch (e2) { console.error('owner dashboard link fallback', e2.message); return res.status(500).json({ error: e.message }); }
+    }
+  } catch (e) { console.error('owner dashboard link', e.message); res.status(500).json({ error: e.message }); }
 });
 
 function emailChangedHtml(newEmail, toOld) {

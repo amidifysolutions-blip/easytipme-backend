@@ -258,7 +258,11 @@ app.post('/create-payment-intent', async (req, res) => {
         const WINDOW = 30 * 24 * 60 * 60 * 1000;
         const lastMs = staff.lastFeeTakenAt ? Date.parse(staff.lastFeeTakenAt) : 0;
         const feeRecently = lastMs && (now - lastMs) < WINDOW;   // already charged this cycle
-        if (isMajor && !feeRecently && tip >= FEE_MIN_TIP && staff.workerProActive !== true) {
+        // Honor the worker's REAL Pro status (source of truth = workers/{uid}), not
+        // just this shop's staff-record mirror, so a Pro worker is always waived.
+        let workerIsPro = staff.workerProActive === true;
+        if (!workerIsPro && staff.claimedUid) { try { const w = await adminDb.collection('workers').doc(staff.claimedUid).get(); if (w.exists && w.data().workerProActive === true) workerIsPro = true; } catch (_) {} }
+        if (isMajor && !feeRecently && tip >= FEE_MIN_TIP && !workerIsPro) {
           const winStart = now - WINDOW;
           const tipsSnap = await adminDb.collection('businesses').doc(businessId).collection('tips').where('staffId', '==', staffId).get();
           let earnedCents = tip;   // include the tip being paid now
@@ -423,6 +427,16 @@ app.post('/billing/confirm', async (req, res) => {
       const newSub = session.subscription || '';
       const since = new Date().toISOString();
       const oldSubs = new Set();
+      // SOURCE OF TRUTH: the worker's OWN account doc. This survives being removed
+      // from any/all shops, so their Pro status — and the ability to cancel it —
+      // is never orphaned when an owner deletes their staff record.
+      try {
+        const wref = adminDb.collection('workers').doc(decoded.uid);
+        const w = await wref.get();
+        const prev = w.exists ? (w.data().workerProSubId || '') : '';
+        if (prev && prev !== newSub) oldSubs.add(prev);
+        await wref.set({ workerProActive: true, workerProSince: since, workerProSubId: newSub }, { merge: true });
+      } catch (e) { console.error('worker confirm workers-doc', e.message); }
       const tag = async (ref, data) => {
         if (data && data.workerProSubId && data.workerProSubId !== newSub) oldSubs.add(data.workerProSubId);
         await ref.set({ workerProActive: true, workerProSince: since, workerProSubId: newSub }, { merge: true });
@@ -448,30 +462,24 @@ app.post('/billing/cancel', async (req, res) => {
     if (!idToken) return res.status(400).json({ error: 'missing-fields' });
     const decoded = await adminAuth.verifyIdToken(idToken);
     if (plan === 'worker') {
-      const { bid, staffId } = req.body;
-      const email = (decoded.email || '').toLowerCase();
-      let subId = '', handled = false;
-      // Preferred path: the app knows its own bid+staffId → cancel directly (no
-      // collection-group index needed). Verify ownership first.
-      if (bid && staffId) {
-        const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
-        const s = await ref.get();
-        if (s.exists && (s.data().claimedUid === decoded.uid || (s.data().email || '').toLowerCase() === email)) {
-          subId = s.data().workerProSubId || '';
-          if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
-          await ref.set({ workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true });
-          handled = true;
+      // SOURCE OF TRUTH: the worker's own account doc — always readable, no index,
+      // and it survives removal from every shop, so they can ALWAYS cancel.
+      const wref = adminDb.collection('workers').doc(decoded.uid);
+      let subId = '';
+      try { const w = await wref.get(); if (w.exists) subId = w.data().workerProSubId || ''; } catch (_) {}
+      // Fallbacks for older subscribers whose sub id is only on a staff record.
+      if (!subId) {
+        const { bid, staffId } = req.body;
+        const email = (decoded.email || '').toLowerCase();
+        if (bid && staffId) {
+          try { const s = await adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId).get(); if (s.exists && (s.data().claimedUid === decoded.uid || (s.data().email || '').toLowerCase() === email)) subId = s.data().workerProSubId || ''; } catch (_) {}
         }
+        if (!subId) { const docs = await workerStaffDocs(decoded.uid); for (const d of docs) { if (!subId && d.data().workerProSubId) subId = d.data().workerProSubId; } }
       }
-      // Fallback: locate the worker's staff records via collection group.
-      if (!handled) {
-        const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', decoded.uid).get();
-        g.forEach(d => { if (!subId && d.data().workerProSubId) subId = d.data().workerProSubId; });
-        if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
-        const batch = adminDb.batch();
-        g.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }));
-        await batch.commit();
-      }
+      if (subId) { try { await stripe.subscriptions.cancel(subId); } catch (_) {} }
+      // Clear the flag on the worker's own doc, then best-effort on their staff records.
+      try { await wref.set({ workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true }); } catch (_) {}
+      try { const docs = await workerStaffDocs(decoded.uid); if (docs.length) { const batch = adminDb.batch(); docs.forEach(d => batch.set(d.ref, { workerProActive: false, workerProCancelledAt: new Date().toISOString() }, { merge: true })); await batch.commit(); } } catch (_) {}
     } else if (plan === 'businesspro') {
       const ref = adminDb.collection('businesses').doc(decoded.uid);
       const snap = await ref.get();
@@ -1796,7 +1804,8 @@ app.post('/staff/workplaces', async (req, res) => {
     // Collect candidate workplace ids: from the worker doc (index-free, primary)
     // and, as a bonus, a collection-group query (works only if that index exists).
     const bidMap = new Map(); // bid -> staffId (hint)
-    try { const w = await adminDb.collection('workers').doc(uid).get(); const shops = (w.exists && w.data().shops) || {}; Object.keys(shops).forEach(bid => bidMap.set(bid, (shops[bid] && shops[bid].staffId) || null)); } catch (_) {}
+    let workerPro = false;
+    try { const w = await adminDb.collection('workers').doc(uid).get(); if (w.exists) { const wd = w.data() || {}; workerPro = wd.workerProActive === true; const shops = wd.shops || {}; Object.keys(shops).forEach(bid => bidMap.set(bid, (shops[bid] && shops[bid].staffId) || null)); } } catch (_) {}
     try { const g = await adminDb.collectionGroup('staff').where('claimedUid', '==', uid).get(); g.forEach(d => { const b = d.ref.parent.parent; if (b) bidMap.set(b.id, d.id); }); } catch (_) {}
     const out = [];
     for (const [bid, hintId] of bidMap) {
@@ -1810,7 +1819,7 @@ app.post('/staff/workplaces', async (req, res) => {
         out.push({ bid, staffId: sid, name: b.data().businessName || '', role: sd.job || '', nickname: sd.nickname || '', left: sd.leftByStaff === true, removed: sd.status === 'removed' });
       } catch (_) {}
     }
-    res.json({ ok: true, workplaces: out });
+    res.json({ ok: true, workplaces: out, pro: workerPro });
   } catch (e) { console.error('workplaces', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1831,6 +1840,9 @@ app.post('/staff/link-payout', async (req, res) => {
     // Remember this workplace under the worker so the in-app switcher can list it
     // without needing a collection-group index.
     try { await adminDb.collection('workers').doc(uid).set({ shops: { [bid]: { staffId, at: new Date().toISOString() } } }, { merge: true }); } catch (_) {}
+    // Mirror the worker's OWN Pro status onto this shop's staff record so the app
+    // display and the $2-fee waiver work here too (source of truth = workers/{uid}).
+    try { const w = await adminDb.collection('workers').doc(uid).get(); if (w.exists && w.data().workerProActive === true && sd.workerProActive !== true) { await ref.set({ workerProActive: true, workerProSubId: w.data().workerProSubId || sd.workerProSubId || '', workerProSince: w.data().workerProSince || new Date().toISOString() }, { merge: true }); } } catch (_) {}
     // Already has one here → make sure it's remembered as the worker's shared account.
     if (sd.connectAccountId) { await setWorkerAccount(uid, sd.connectAccountId); return res.json({ ok: true, linked: false, already: true, accountId: sd.connectAccountId }); }
     const shared = await getWorkerAccount(uid);

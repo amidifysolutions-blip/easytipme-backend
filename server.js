@@ -609,14 +609,14 @@ app.post('/business/delete', async (req, res) => {
       const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
       for (const br of brs.docs) {
         try { mergeHeld(await releaseHeldForBusiness(br.ref)); } catch (_) {}
-        for (const sub of ['staff', 'tips', 'consents']) {
+        for (const sub of ['staff', 'staffPrivate', 'tips', 'consents']) {
           try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {}
         }
         try { const c = br.data().shopCode; if (c) await adminDb.collection('shopCodes').doc(c).delete(); } catch (_) {}
         try { await br.ref.delete(); } catch (_) {}
       }
     } catch (e) { console.error('delete branches', e.message); }
-    for (const sub of ['staff', 'tips', 'consents']) {
+    for (const sub of ['staff', 'staffPrivate', 'tips', 'consents']) {
       try {
         const docs = await ref.collection(sub).get();
         let batch = adminDb.batch(), n = 0;
@@ -658,12 +658,12 @@ app.post('/admin/delete-business', async (req, res) => {
       const brs = await adminDb.collection('businesses').where('orgOwnerUid', '==', uid).get();
       for (const br of brs.docs) {
         try { mergeHeld(await releaseHeldForBusiness(br.ref)); } catch (_) {}
-        for (const sub of ['staff', 'tips', 'consents']) { try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {} }
+        for (const sub of ['staff', 'staffPrivate', 'tips', 'consents']) { try { const docs = await br.ref.collection(sub).get(); let bt = adminDb.batch(), m = 0; for (const dd of docs.docs) { bt.delete(dd.ref); if (++m >= 400) { await bt.commit(); bt = adminDb.batch(); m = 0; } } if (m > 0) await bt.commit(); } catch (_) {} }
         try { const c = br.data().shopCode; if (c) await adminDb.collection('shopCodes').doc(c).delete(); } catch (_) {}
         try { await br.ref.delete(); } catch (_) {}
       }
     } catch (e) { console.error('admin delete branches', e.message); }
-    for (const sub of ['staff', 'tips', 'consents']) {
+    for (const sub of ['staff', 'staffPrivate', 'tips', 'consents']) {
       try { const docs = await ref.collection(sub).get(); let batch = adminDb.batch(), n = 0; for (const dd of docs.docs) { batch.delete(dd.ref); if (++n >= 400) { await batch.commit(); batch = adminDb.batch(); n = 0; } } if (n > 0) await batch.commit(); } catch (e) { console.error('admin delete sub ' + sub, e.message); }
     }
     try { const codes = await adminDb.collection('shopCodes').where('bid', '==', uid).get(); const b = adminDb.batch(); codes.forEach(d => b.delete(d.ref)); await b.commit(); } catch (_) {}
@@ -695,7 +695,7 @@ app.post('/admin/free-email', async (req, res) => {
       const ref = adminDb.collection('businesses').doc(uid);
       const s = await ref.get();
       if (s.exists) {
-        for (const sub of ['staff', 'tips', 'consents']) { try { const docs = await ref.collection(sub).get(); let b = adminDb.batch(), n = 0; for (const dd of docs.docs) { b.delete(dd.ref); if (++n >= 400) { await b.commit(); b = adminDb.batch(); n = 0; } } if (n > 0) await b.commit(); } catch (_) {} }
+        for (const sub of ['staff', 'staffPrivate', 'tips', 'consents']) { try { const docs = await ref.collection(sub).get(); let b = adminDb.batch(), n = 0; for (const dd of docs.docs) { b.delete(dd.ref); if (++n >= 400) { await b.commit(); b = adminDb.batch(); n = 0; } } if (n > 0) await b.commit(); } catch (_) {} }
         try { const code = s.data().shopCode; if (code) await adminDb.collection('shopCodes').doc(code).delete(); } catch (_) {}
         try { await ref.delete(); } catch (_) {}
       }
@@ -799,7 +799,7 @@ app.post('/branch/delete', async (req, res) => {
     const ref = adminDb.collection('businesses').doc(id);
     const snap = await ref.get();
     if (!snap.exists || snap.data().orgOwnerUid !== decoded.uid) return res.status(403).json({ error: 'not-your-branch' });
-    for (const sub of ['staff', 'tips', 'consents']) {
+    for (const sub of ['staff', 'staffPrivate', 'tips', 'consents']) {
       try {
         const docs = await ref.collection(sub).get();
         let batch = adminDb.batch(), n = 0;
@@ -822,11 +822,20 @@ async function ownsLocation(uid, id) {
   if (id === uid) return true;
   try { const s = await adminDb.collection('businesses').doc(id).get(); return s.exists && s.data().orgOwnerUid === uid; } catch (_) { return false; }
 }
-const STAFF_FIELDS = ['nickname', 'realName', 'email', 'phone', 'job', 'photo', 'days', 'shift1', 'shift2', 'published', 'status'];
+// Public staff fields only — real name & phone are PRIVATE and stored in the
+// protected `staffPrivate` sub-doc (never on the publicly-readable staff doc).
+const STAFF_FIELDS = ['nickname', 'email', 'job', 'photo', 'days', 'shift1', 'shift2', 'published', 'status'];
 function cleanStaff(data) {
   const out = {};
   for (const k of STAFF_FIELDS) { if (data && data[k] !== undefined) out[k] = data[k]; }
   if (out.email) out.email = String(out.email).toLowerCase().trim();
+  return out;
+}
+// The private half (real name, phone) for the protected staffPrivate sub-doc.
+function privateStaff(data) {
+  const out = {};
+  if (data && data.realName !== undefined) out.realName = data.realName;
+  if (data && data.phone !== undefined) out.phone = data.phone;
   return out;
 }
 
@@ -856,11 +865,20 @@ app.post('/branch/staff/save', async (req, res) => {
     const decoded = await adminAuth.verifyIdToken(idToken);
     if (!(await ownsLocation(decoded.uid, id))) return res.status(403).json({ error: 'not-your-location' });
     const col = adminDb.collection('businesses').doc(id).collection('staff');
+    const pcol = adminDb.collection('businesses').doc(id).collection('staffPrivate');
     const clean = cleanStaff(data);
-    if (staffId) { await col.doc(staffId).set(clean, { merge: true }); return res.json({ ok: true, staffId }); }
+    const priv = privateStaff(data);
+    if (staffId) {
+      // Strip any legacy real name / phone off the public doc, keep them private.
+      const admin = require('firebase-admin');
+      await col.doc(staffId).set(Object.assign({}, clean, { realName: admin.firestore.FieldValue.delete(), phone: admin.firestore.FieldValue.delete() }), { merge: true });
+      if (Object.keys(priv).length) await pcol.doc(staffId).set(priv, { merge: true });
+      return res.json({ ok: true, staffId });
+    }
     clean.published = clean.published !== false;
     clean.createdAt = new Date().toISOString();
     const ref = await col.add(clean);
+    if (Object.keys(priv).length) { try { await pcol.doc(ref.id).set(priv); } catch (_) {} }
     res.json({ ok: true, staffId: ref.id, created: true });
   } catch (e) { console.error('branch staff save', e.message); res.status(500).json({ error: e.message }); }
 });
@@ -1428,8 +1446,9 @@ app.post('/staff/delete', async (req, res) => {
     const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
     const snap = await ref.get();
     const claimedUid = snap.exists ? (snap.data().claimedUid || null) : null;
-    // 1) remove the staff record for this shop
+    // 1) remove the staff record for this shop (public doc + its private half)
     await ref.delete();
+    try { await adminDb.collection('businesses').doc(bid).collection('staffPrivate').doc(staffId).delete(); } catch (_) {}
     // 2) decide whether the login account can be fully removed
     let authDeleted = false;
     if (claimedUid && claimedUid !== bid) {
@@ -1956,6 +1975,7 @@ app.post('/staff/delete-account', async (req, res) => {
       // subcollection) so the owner keeps their history and commission.
       try {
         await sd.ref.delete();
+        if (bizRef) { try { await bizRef.collection('staffPrivate').doc(staffId).delete(); } catch (_) {} }
         workplaces++;
       } catch (e) { console.error('delete-account staff delete', e.message); }
     }

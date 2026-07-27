@@ -832,7 +832,7 @@ async function ownsLocation(uid, id) {
 }
 // Public staff fields only — real name & phone are PRIVATE and stored in the
 // protected `staffPrivate` sub-doc (never on the publicly-readable staff doc).
-const STAFF_FIELDS = ['nickname', 'email', 'job', 'photo', 'days', 'shift1', 'shift2', 'published', 'status'];
+const STAFF_FIELDS = ['nickname', 'email', 'job', 'photo', 'schedule', 'days', 'shift1', 'shift2', 'published', 'status'];
 function cleanStaff(data) {
   const out = {};
   for (const k of STAFF_FIELDS) { if (data && data[k] !== undefined) out[k] = data[k]; }
@@ -879,7 +879,8 @@ app.post('/branch/staff/save', async (req, res) => {
     if (staffId) {
       // Strip any legacy real name / phone off the public doc, keep them private.
       const admin = require('firebase-admin');
-      await col.doc(staffId).set(Object.assign({}, clean, { realName: admin.firestore.FieldValue.delete(), phone: admin.firestore.FieldValue.delete() }), { merge: true });
+      const drop = clean.schedule !== undefined ? { days: admin.firestore.FieldValue.delete(), shift1: admin.firestore.FieldValue.delete(), shift2: admin.firestore.FieldValue.delete() } : {};
+      await col.doc(staffId).set(Object.assign({}, clean, drop, { realName: admin.firestore.FieldValue.delete(), phone: admin.firestore.FieldValue.delete() }), { merge: true });
       if (Object.keys(priv).length) await pcol.doc(staffId).set(priv, { merge: true });
       return res.json({ ok: true, staffId });
     }

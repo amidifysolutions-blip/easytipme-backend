@@ -830,6 +830,27 @@ async function ownsLocation(uid, id) {
   if (id === uid) return true;
   try { const s = await adminDb.collection('businesses').doc(id).get(); return s.exists && s.data().orgOwnerUid === uid; } catch (_) { return false; }
 }
+// Look up each worker's Stripe payout readiness (bank connected?). Returns a map
+// { staffId: 'connected' | 'pending' | 'none' }:
+//   connected = a Stripe account exists AND can receive payouts (bank linked)
+//   pending   = account exists but onboarding not finished (no bank yet)
+//   none      = the worker never started Stripe onboarding
+// Uses the same `stripe` client the payment path reads worker accounts with.
+async function bankStatusFor(staffArr) {
+  const out = {};
+  await Promise.all((staffArr || []).map(async (s) => {
+    const sid = s.id || s._id;
+    if (!sid) return;
+    const acct = s.connectAccountId;
+    if (!acct) { out[sid] = 'none'; return; }
+    try {
+      const a = await stripe.accounts.retrieve(acct);
+      const ready = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled);
+      out[sid] = ready ? 'connected' : 'pending';
+    } catch (_) { out[sid] = 'pending'; }
+  }));
+  return out;
+}
 // Public staff fields only — real name & phone are PRIVATE and stored in the
 // protected `staffPrivate` sub-doc (never on the publicly-readable staff doc).
 const STAFF_FIELDS = ['nickname', 'email', 'job', 'photo', 'schedule', 'days', 'shift1', 'shift2', 'published', 'status'];
@@ -859,8 +880,26 @@ app.post('/branch/team', async (req, res) => {
     const bsnap = await bref.get(); const b = bsnap.exists ? bsnap.data() : {};
     const ss = await bref.collection('staff').get();
     const staff = ss.docs.map(d => Object.assign({ id: d.id }, d.data()));
-    res.json({ ok: true, name: b.businessName || '', currency: b.currency || 'CAD', shopCode: b.shopCode || '', tipPresets: b.tipPresets || [5, 10, 20, ''], staff });
+    const bankStatus = await bankStatusFor(staff);
+    res.json({ ok: true, name: b.businessName || '', currency: b.currency || 'CAD', shopCode: b.shopCode || '', tipPresets: b.tipPresets || [5, 10, 20, ''], staff, bankStatus });
   } catch (e) { console.error('branch team', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Bank-connection status for a location's team (owner-only). The owner dashboard
+// reads staff from Firestore directly but can't see live Stripe payout state,
+// so it calls this to show a "bank connected / setup pending / none" badge.
+app.post('/staff/bank-status', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, id } = req.body;
+    if (!idToken || !id) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await ownsLocation(decoded.uid, id))) return res.status(403).json({ error: 'not-your-location' });
+    const ss = await adminDb.collection('businesses').doc(id).collection('staff').get();
+    const staff = ss.docs.map(d => Object.assign({ id: d.id }, d.data()));
+    const bankStatus = await bankStatusFor(staff);
+    res.json({ ok: true, bankStatus });
+  } catch (e) { console.error('bank-status', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Add / update a team member on a location (owner-only). The invite email is

@@ -125,11 +125,13 @@ app.post('/create-payment-intent', async (req, res) => {
   try {
     const { businessId, staffId, tipCents, currency, amount } = req.body;
 
-    // ---- Legacy / team path -------------------------------------------------
-    // When we don't have a single recipient to route to (e.g. a team/multi tip,
-    // which we split in a later phase), fall back to a plain charge on the
-    // platform so tipping still works. No split happens here.
-    if (!businessId || !staffId || !tipCents) {
+    // ---- Legacy fallback ----------------------------------------------------
+    // Only when we truly can't route: no business, no amount, and NEITHER a
+    // single recipient (staffId) NOR an explicit multi-select list (poolStaffIds).
+    // A manual multi-select sends businessId + tipCents + poolStaffIds (no single
+    // staffId) and must fall through to the split logic below — NOT here.
+    const splitIds = Array.isArray(req.body.poolStaffIds) ? req.body.poolStaffIds.filter(x => typeof x === 'string' && x) : [];
+    if (!businessId || !tipCents || (!staffId && splitIds.length === 0)) {
       const pi = await stripe.paymentIntents.create({
         amount: amount || tipCents,
         currency: (currency || 'cad').toLowerCase(),
@@ -195,7 +197,10 @@ app.post('/create-payment-intent', async (req, res) => {
     // charge succeeds via /settle-pool (Stripe transfers on the SAME charge) — the
     // money is divided at source, never moved between workers' settled balances.
     const poolIds = Array.isArray(req.body.poolStaffIds) ? req.body.poolStaffIds.filter(x => typeof x === 'string' && x).slice(0, 50) : [];
-    if (biz.tipPoolEnabled === true && req.body.pool === true && poolIds.length) {
+    // Split the tip equally when EITHER the owner's auto Tip-Pool is on (single
+    // pick, pool=true) OR the customer manually multi-selected the team
+    // (split=true). Both settle via /settle-pool on the same charge.
+    if (poolIds.length && (req.body.split === true || (biz.tipPoolEnabled === true && req.body.pool === true))) {
       let ownerShare = 0;
       if (biz.tipShareEnabled === true && ownerPro) { const sp = Math.min(15, Math.max(0, Number(biz.tipSharePercent) || 0)); ownerShare = Math.round(tip * sp / 100); }
       const pi = await stripe.paymentIntents.create({

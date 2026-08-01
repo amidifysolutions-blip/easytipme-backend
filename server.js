@@ -2252,6 +2252,230 @@ app.post('/staff/register-push', async (req, res) => {
   } catch (e) { console.error('register-push', e.message); return res.status(500).json({ error: e.message }); }
 });
 
+// ============================================================================
+// Manager API (/mgr/*) — powers the EasyTipMe Manager mobile app.
+// A business = the owner's uid (businesses/{ownerUid}). The owner can delegate
+// access to "supervisors" by email; a supervisor signs in with their OWN account
+// and manages the business through these endpoints. All authorization runs via
+// the Admin SDK (no Firestore rules change), exactly like branch management.
+//   canManage = you own the location (own shop / branch head office) OR you are a
+//   member (supervisor) of its root business. Member management (granting access)
+//   is OWNER-ONLY to prevent privilege escalation. Billing & account deletion are
+//   never exposed here — supervisors can do everything except those two.
+// ============================================================================
+async function rootBidOf(id) {
+  try { const s = await adminDb.collection('businesses').doc(id).get(); return (s.exists && s.data().orgOwnerUid) || id; }
+  catch (_) { return id; }
+}
+async function isMemberEmail(email, rootBid) {
+  const e = String(email || '').toLowerCase().trim();
+  if (!e || !rootBid) return false;
+  try {
+    const q = await adminDb.collection('businesses').doc(rootBid).collection('members').where('email', '==', e).limit(1).get();
+    return !q.empty;
+  } catch (_) { return false; }
+}
+// Full management access (owner OR supervisor) to a given location id.
+async function canManage(decoded, id) {
+  if (!decoded || !id) return false;
+  if (await ownsLocation(decoded.uid, id)) return true;
+  const root = await rootBidOf(id);
+  return await isMemberEmail(decoded.email, root);
+}
+// True only for the actual account owner of the root business (uid === rootBid).
+// Used to gate member management (grant/revoke supervisor access).
+async function isRootOwner(decoded, id) {
+  if (!decoded || !id) return false;
+  const root = await rootBidOf(id);
+  return decoded.uid === root;
+}
+
+// Which businesses can the signed-in user manage? Their own shop (if any) plus
+// every business that has invited them as a supervisor. The Manager app calls
+// this on launch to pick the active business.
+app.post('/mgr/access', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const email = String(decoded.email || '').toLowerCase().trim();
+    const out = [];
+    // Own business (a shop whose doc id is the user's uid, and isn't a branch).
+    try {
+      const own = await adminDb.collection('businesses').doc(decoded.uid).get();
+      if (own.exists && !own.data().orgOwnerUid) out.push({ bid: decoded.uid, name: own.data().businessName || 'My business', role: 'owner' });
+    } catch (_) {}
+    // Businesses that invited this email as a supervisor.
+    if (email) {
+      try {
+        const q = await adminDb.collectionGroup('members').where('email', '==', email).get();
+        for (const d of q.docs) {
+          const bid = d.ref.parent.parent.id;
+          if (out.some(o => o.bid === bid)) continue;
+          const bs = await adminDb.collection('businesses').doc(bid).get();
+          out.push({ bid, name: (bs.exists && bs.data().businessName) || 'Business', role: 'manager' });
+        }
+      } catch (e) { console.error('mgr access group', e.message); }
+    }
+    res.json({ ok: true, businesses: out });
+  } catch (e) { console.error('mgr access', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Dashboard overview for a business: name, currency, team count, tips summary.
+app.post('/mgr/overview', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid } = req.body || {};
+    if (!idToken || !bid) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await canManage(decoded, bid))) return res.status(403).json({ error: 'no-access' });
+    const bref = adminDb.collection('businesses').doc(bid);
+    const bsnap = await bref.get(); const b = bsnap.exists ? bsnap.data() : {};
+    const ss = await bref.collection('staff').get();
+    const teamCount = ss.docs.filter(d => (d.data().status !== 'removed')).length;
+    const ts = await bref.collection('tips').get();
+    let tipsTotal = 0; const recent = [];
+    ts.docs.forEach(d => { const t = d.data(); const amt = Number(t.tip || 0); if (amt > 0) tipsTotal += amt; });
+    ts.docs
+      .map(d => Object.assign({ id: d.id }, d.data()))
+      .sort((a, b2) => String(b2.createdAt || '').localeCompare(String(a.createdAt || '')))
+      .slice(0, 10)
+      .forEach(t => recent.push({ id: t.id, tip: Number(t.tip || 0), currency: t.currency || b.currency || 'CAD', rating: t.rating || null, fromName: t.fromName || '', createdAt: t.createdAt || '', staffId: t.staffId || '' }));
+    res.json({ ok: true, name: b.businessName || 'My business', currency: b.currency || 'CAD', shopCode: b.shopCode || '', teamCount, tipsCount: ts.size, tipsTotal, recent });
+  } catch (e) { console.error('mgr overview', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Team list for a business (manager sees full details incl. private name/phone).
+app.post('/mgr/team', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid } = req.body || {};
+    if (!idToken || !bid) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await canManage(decoded, bid))) return res.status(403).json({ error: 'no-access' });
+    const bref = adminDb.collection('businesses').doc(bid);
+    const ss = await bref.collection('staff').get();
+    const ps = await bref.collection('staffPrivate').get();
+    const priv = {}; ps.docs.forEach(d => priv[d.id] = d.data());
+    const staff = ss.docs.map(d => Object.assign({ id: d.id }, d.data(), priv[d.id] || {}));
+    const bankStatus = await bankStatusFor(staff);
+    res.json({ ok: true, staff, bankStatus });
+  } catch (e) { console.error('mgr team', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Add / update a team member (manager). Mirrors /branch/staff/save but canManage.
+app.post('/mgr/staff/save', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid, staffId, data } = req.body || {};
+    if (!idToken || !bid || !data || !data.nickname) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await canManage(decoded, bid))) return res.status(403).json({ error: 'no-access' });
+    const admin = require('firebase-admin');
+    const col = adminDb.collection('businesses').doc(bid).collection('staff');
+    const pcol = adminDb.collection('businesses').doc(bid).collection('staffPrivate');
+    const clean = cleanStaff(data);
+    const priv = privateStaff(data);
+    if (staffId) {
+      await col.doc(staffId).set(Object.assign({}, clean, { realName: admin.firestore.FieldValue.delete(), phone: admin.firestore.FieldValue.delete() }), { merge: true });
+      if (Object.keys(priv).length) await pcol.doc(staffId).set(priv, { merge: true });
+      return res.json({ ok: true, staffId });
+    }
+    clean.published = clean.published !== false;
+    clean.createdAt = new Date().toISOString();
+    const ref = await col.add(clean);
+    if (Object.keys(priv).length) { try { await pcol.doc(ref.id).set(priv); } catch (_) {} }
+    res.json({ ok: true, staffId: ref.id, created: true });
+  } catch (e) { console.error('mgr staff save', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Remove / restore / delete a team member (manager).
+app.post('/mgr/staff/remove', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid, staffId, action } = req.body || {};
+    if (!idToken || !bid || !staffId) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await canManage(decoded, bid))) return res.status(403).json({ error: 'no-access' });
+    const ref = adminDb.collection('businesses').doc(bid).collection('staff').doc(staffId);
+    if (action === 'delete') { await ref.delete(); }
+    else if (action === 'restore') { await ref.set({ status: 'active', published: true }, { merge: true }); }
+    else { await ref.set({ status: 'removed', published: false }, { merge: true }); }
+    res.json({ ok: true });
+  } catch (e) { console.error('mgr staff remove', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ---- Access / delegation (supervisors) — OWNER ONLY -------------------------
+// List the supervisors who have delegated access to a business.
+app.post('/mgr/members/list', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid } = req.body || {};
+    if (!idToken || !bid) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await isRootOwner(decoded, bid))) return res.status(403).json({ error: 'owner-only' });
+    const root = await rootBidOf(bid);
+    const ms = await adminDb.collection('businesses').doc(root).collection('members').get();
+    const members = ms.docs.map(d => Object.assign({ id: d.id }, d.data()));
+    res.json({ ok: true, members });
+  } catch (e) { console.error('mgr members list', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Invite a supervisor by email (owner only). Idempotent per email.
+app.post('/mgr/members/invite', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid, email } = req.body || {};
+    const addr = String(email || '').toLowerCase().trim();
+    if (!idToken || !bid || !addr || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(addr)) return res.status(400).json({ error: 'bad-email' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await isRootOwner(decoded, bid))) return res.status(403).json({ error: 'owner-only' });
+    if (addr === String(decoded.email || '').toLowerCase().trim()) return res.status(400).json({ error: 'cant-invite-self' });
+    const root = await rootBidOf(bid);
+    const col = adminDb.collection('businesses').doc(root).collection('members');
+    const existing = await col.where('email', '==', addr).limit(1).get();
+    if (!existing.empty) return res.json({ ok: true, already: true });
+    const ref = await col.add({ email: addr, role: 'manager', addedBy: decoded.uid, addedByEmail: String(decoded.email || ''), addedAt: new Date().toISOString() });
+    // Best-effort email invite via Brevo (never blocks the grant).
+    try {
+      const apiKey = process.env.BREVO_API_KEY;
+      const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+      const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+      const bs = await adminDb.collection('businesses').doc(root).get();
+      const bizName = (bs.exists && bs.data().businessName) || 'a business';
+      if (apiKey) {
+        await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({
+            sender: { name: senderName, email: senderEmail }, to: [{ email: addr }],
+            subject: `You've been given manager access to ${bizName} on EasyTipMe`,
+            htmlContent: `<div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#1d1d1f"><h2 style="margin:0 0 12px">Manager access granted</h2><p style="line-height:1.6">You've been added as a manager for <b>${bizName}</b> on EasyTipMe. Download the <b>EasyTipMe Manager</b> app and sign in with this email address (${addr}) to manage the team, view tips, and more.</p><p style="font-size:12px;color:#9a9aa0;margin-top:18px">If you weren't expecting this, you can ignore this email.</p></div>`
+          })
+        }).catch(() => {});
+      }
+    } catch (_) {}
+    res.json({ ok: true, id: ref.id });
+  } catch (e) { console.error('mgr members invite', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Revoke a supervisor's access (owner only).
+app.post('/mgr/members/remove', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, bid, email } = req.body || {};
+    const addr = String(email || '').toLowerCase().trim();
+    if (!idToken || !bid || !addr) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    if (!(await isRootOwner(decoded, bid))) return res.status(403).json({ error: 'owner-only' });
+    const root = await rootBidOf(bid);
+    const col = adminDb.collection('businesses').doc(root).collection('members');
+    const q = await col.where('email', '==', addr).get();
+    await Promise.all(q.docs.map(d => d.ref.delete()));
+    res.json({ ok: true, removed: q.size });
+  } catch (e) { console.error('mgr members remove', e.message); res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

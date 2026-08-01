@@ -2231,6 +2231,27 @@ app.post('/staff/change-email', async (req, res) => {
   } catch (e) { console.error('change-email', e.message); return res.status(500).json({ error: e.message }); }
 });
 
+// Register a worker's Expo push token so the tip Cloud Function can notify them.
+// Stored (admin) in the isolated `pushTokens/{email}` collection — no money logic,
+// no Stripe. The app calls this after sign-in; a failure here never affects tips.
+app.post('/staff/register-push', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, expoPushToken } = req.body || {};
+    if (!idToken || !expoPushToken) return res.status(400).json({ error: 'missing-fields' });
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const email = String(decoded.email || '').toLowerCase();
+    if (!email) return res.status(400).json({ error: 'no-email' });
+    const ref = adminDb.collection('pushTokens').doc(email);
+    const cur = await ref.get();
+    const set = new Set((cur.exists && Array.isArray(cur.data().tokens)) ? cur.data().tokens : []);
+    set.add(String(expoPushToken));
+    const tokens = Array.from(set).slice(-10); // keep at most 10 devices
+    await ref.set({ tokens, uid: decoded.uid, updatedAt: new Date().toISOString() }, { merge: true });
+    return res.json({ ok: true });
+  } catch (e) { console.error('register-push', e.message); return res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

@@ -2450,7 +2450,7 @@ app.post('/mgr/members/invite', async (req, res) => {
           body: JSON.stringify({
             sender: { name: senderName, email: senderEmail }, to: [{ email: addr }],
             subject: `You've been given manager access to ${bizName} on EasyTipMe`,
-            htmlContent: `<div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#1d1d1f"><h2 style="margin:0 0 12px">Manager access granted</h2><p style="line-height:1.6">You've been added as a manager for <b>${bizName}</b> on EasyTipMe. Download the <b>EasyTipMe Manager</b> app and sign in with this email address (${addr}) to manage the team, view tips, and more.</p><p style="font-size:12px;color:#9a9aa0;margin-top:18px">If you weren't expecting this, you can ignore this email.</p></div>`
+            htmlContent: `<div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#1d1d1f"><h2 style="margin:0 0 12px">Manager access granted</h2><p style="line-height:1.6">You've been added as a manager for <b>${bizName}</b> on EasyTipMe. Sign in at <b>easytipme.com/manage.html</b> with this email address (${addr}) to manage the team, set schedules, and view tips. (If you don't have a password yet, use "Forgot your password?" on that page to set one.)</p><p style="font-size:12px;color:#9a9aa0;margin-top:18px">If you weren't expecting this, you can ignore this email.</p></div>`
           })
         }).catch(() => {});
       }

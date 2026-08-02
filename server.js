@@ -2450,7 +2450,7 @@ app.post('/mgr/members/invite', async (req, res) => {
           body: JSON.stringify({
             sender: { name: senderName, email: senderEmail }, to: [{ email: addr }],
             subject: `You've been given manager access to ${bizName} on EasyTipMe`,
-            htmlContent: `<div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#1d1d1f"><h2 style="margin:0 0 12px">Manager access granted</h2><p style="line-height:1.6">You've been added as a manager for <b>${bizName}</b> on EasyTipMe. Sign in at <b>easytipme.com/manage.html</b> with this email address (${addr}) to manage the team, set schedules, and view tips. (If you don't have a password yet, use "Forgot your password?" on that page to set one.)</p><p style="font-size:12px;color:#9a9aa0;margin-top:18px">If you weren't expecting this, you can ignore this email.</p></div>`
+            htmlContent: `<div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#1d1d1f"><h2 style="margin:0 0 12px">Manager access granted</h2><p style="line-height:1.6">You've been added as a manager for <b>${bizName}</b> on EasyTipMe. Sign in at <b>easytipme.com/manage.html</b> — just enter this email address (${addr}) and we'll send you a sign-in code. No password needed. From there you can manage the team, set schedules, and view tips.</p><p style="font-size:12px;color:#9a9aa0;margin-top:18px">If you weren't expecting this, you can ignore this email.</p></div>`
           })
         }).catch(() => {});
       }
@@ -2474,6 +2474,73 @@ app.post('/mgr/members/remove', async (req, res) => {
     await Promise.all(q.docs.map(d => d.ref.delete()));
     res.json({ ok: true, removed: q.size });
   } catch (e) { console.error('mgr members remove', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// ---- Passwordless sign-in for managers/supervisors (email + 6-digit code) ----
+// Stripe-Connect style: NO password, ever. Enter email → get a code → you're in.
+// The code proves email ownership; we get-or-create the Firebase account and hand
+// back a custom token the client exchanges for a session.
+function loginCodeHtml(code) {
+  return emailShell(`<div style="text-align:center">
+    <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Your sign-in code</div>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 10px;">Enter this code at easytipme.com/manage.html to sign in:</p>
+    <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#0071e3;background:#f2f7ff;border-radius:14px;padding:16px 0;margin:0 0 10px;">${escapeHtml(code)}</div>
+    <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:10px 0 0;">This code expires in 15 minutes. If you didn't request it, you can ignore this email.</p>
+  </div>`);
+}
+async function emailHasManagerAccess(addr) {
+  try { const q = await adminDb.collectionGroup('members').where('email', '==', addr).limit(1).get(); return !q.empty; }
+  catch (_) { return false; }
+}
+app.post('/mgr/login/request', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.json({ ok: false, error: 'admin-not-configured' });
+    const addr = String((req.body && req.body.email) || '').toLowerCase().trim();
+    if (!addr || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(addr)) return res.status(400).json({ ok: false, error: 'bad-email' });
+    // Only email a code to someone who has access (a supervisor) or an existing
+    // account. Respond ok either way so we never reveal who exists.
+    let allowed = await emailHasManagerAccess(addr);
+    if (!allowed) { try { await adminAuth.getUserByEmail(addr); allowed = true; } catch (_) {} }
+    if (!allowed) return res.json({ ok: true });
+    const ref = adminDb.collection('loginCodes').doc(addr);
+    const now = Date.now();
+    const cur = await ref.get();
+    if (cur.exists && cur.data().lastSentMs && (now - cur.data().lastSentMs) < 25000) return res.json({ ok: true });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await ref.set({ code, email: addr, expMs: now + 15 * 60000, tries: 0, lastSentMs: now });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (apiKey) {
+      await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr }], subject: 'Your EasyTipMe sign-in code', htmlContent: loginCodeHtml(code) })
+      }).catch(() => {});
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('mgr login request', e.message); res.json({ ok: false, error: e.message }); }
+});
+app.post('/mgr/login/verify', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const addr = String((req.body && req.body.email) || '').toLowerCase().trim();
+    const code = String((req.body && req.body.code) || '').trim();
+    if (!addr || !code) return res.status(400).json({ error: 'missing-fields' });
+    const ref = adminDb.collection('loginCodes').doc(addr);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(400).json({ error: 'no-code' });
+    const d = snap.data();
+    if (Date.now() > d.expMs) { await ref.delete(); return res.status(400).json({ error: 'expired' }); }
+    if ((d.tries || 0) >= 5) return res.status(429).json({ error: 'too-many' });
+    if (code !== String(d.code)) { await ref.update({ tries: (d.tries || 0) + 1 }); return res.status(400).json({ error: 'wrong-code' }); }
+    // Code is correct → get-or-create the account (email is now proven).
+    let uid = null;
+    try { const u = await adminAuth.getUserByEmail(addr); uid = u.uid; if (!u.emailVerified) { try { await adminAuth.updateUser(uid, { emailVerified: true }); } catch (_) {} } }
+    catch (_) { const nu = await adminAuth.createUser({ email: addr, emailVerified: true }); uid = nu.uid; }
+    const token = await adminAuth.createCustomToken(uid);
+    await ref.delete();
+    res.json({ ok: true, token });
+  } catch (e) { console.error('mgr login verify', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => {

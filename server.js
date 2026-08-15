@@ -1992,12 +1992,36 @@ app.post('/connect/balance', async (req, res) => {
 // (Stripe's short hold on pending funds still applies).
 app.post('/connect/withdraw', async (req, res) => {
   try {
-    const { accountId } = req.body;
+    const { accountId, method } = req.body;
     if (!accountId) return res.status(400).json({ error: 'missing accountId' });
     const hdr = { stripeAccount: accountId };
     // Defensive: guarantee this account is on manual payouts (older accounts may
     // still be on the automatic default) so it never auto-deposits.
     try { await connectStripe.accounts.update(accountId, { settings: { payouts: { schedule: { interval: 'manual' } } } }); } catch (_) {}
+
+    // INSTANT (~30 min): worker pays a 5% fee (set as our platform instant-payout
+    // pricing in Stripe). net_available = what the worker receives after that fee;
+    // Stripe collects ~1% and the platform keeps the rest. Requires an eligible
+    // instant destination (a debit card in CA) and account eligibility.
+    if (method === 'instant') {
+      const bal = await connectStripe.balance.retrieve({ ...hdr, expand: ['instant_available.net_available'] });
+      const ia = (bal.instant_available || []).filter(b => (b.amount || 0) > 0);
+      if (!ia.length) return res.status(400).json({ error: 'no-instant-funds' });
+      const payouts = [];
+      for (const b of ia) {
+        const net = (b.net_available && b.net_available[0] && b.net_available[0].amount != null) ? b.net_available[0].amount : b.amount;
+        if (net <= 0) continue;
+        const p = await connectStripe.payouts.create(
+          { amount: net, currency: b.currency, method: 'instant', statement_descriptor: 'TIP', metadata: { kind: 'worker-cashout-instant' } },
+          hdr
+        );
+        payouts.push({ amount: p.amount / 100, currency: p.currency, status: p.status });
+      }
+      if (!payouts.length) return res.status(400).json({ error: 'no-instant-funds' });
+      return res.json({ ok: true, instant: true, payouts });
+    }
+
+    // STANDARD (free, 1–2 business days).
     const bal = await connectStripe.balance.retrieve(hdr);
     const buckets = (bal.available || []).filter(b => (b.amount || 0) > 0);
     if (!buckets.length) return res.status(400).json({ error: 'no-available-funds' });
@@ -2011,6 +2035,77 @@ app.post('/connect/withdraw', async (req, res) => {
     }
     res.json({ ok: true, payouts });
   } catch (e) { console.error('connect withdraw', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Safety-net auto-sweep (hidden backstop, NOT shown in the app).
+// Purpose: money must never sit stuck in a worker's Connect balance forever — if
+// a worker forgets, abandons the account, or passes away, an idle balance is
+// pushed to THEIR OWN linked bank so it becomes part of their personal funds/
+// estate instead of being frozen with us.
+//
+// Legally safe for closed-work-permit workers: this fires at most ~twice a year
+// per worker, so the bank line is an occasional "TIP" lump — never salary-like.
+//
+// Self-limiting: for each worker account we only sweep if the LAST payout of any
+// kind was > 6 months ago (or, if never paid out, the account is > 6 months old)
+// AND the available balance is >= $5. Because of the per-account 6-month check,
+// the scheduler can call this as often as it likes with no double-sweeps.
+//
+// Triggered by a scheduled Cloud Function (Cloud Scheduler) that POSTs here with
+// the shared CRON_SECRET. Not reachable without that secret.
+app.post('/cron/sweep-idle-balances', async (req, res) => {
+  try {
+    const secret = req.headers['x-cron-secret'] || (req.body && req.body.secret);
+    if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const SIX_MONTHS = 183 * 24 * 60 * 60; // seconds
+    const MIN_CENTS = 500;                  // only sweep >= $5 available
+    const nowSec = Math.floor(Date.now() / 1000);
+    const swept = [];
+    let scanned = 0, considered = 0, starting_after;
+
+    while (true) {
+      const page = await connectStripe.accounts.list(
+        Object.assign({ limit: 100 }, starting_after ? { starting_after } : {})
+      );
+      for (const acc of page.data) {
+        scanned++;
+        try {
+          // Worker accounts only (created with { bid, staffId } metadata).
+          if (!acc.metadata || !acc.metadata.staffId) continue;
+          if (!acc.payouts_enabled) continue;
+          const hdr = { stripeAccount: acc.id };
+
+          const bal = await connectStripe.balance.retrieve(hdr);
+          const buckets = (bal.available || []).filter(b => (b.amount || 0) >= MIN_CENTS);
+          if (!buckets.length) continue;
+
+          // Last payout of any kind -> how long has money been idle?
+          const pl = await connectStripe.payouts.list({ limit: 1 }, hdr);
+          const lastPayoutSec = (pl.data[0] && pl.data[0].created) ? pl.data[0].created : null;
+          const refSec = lastPayoutSec || acc.created || nowSec;
+          if (nowSec - refSec < SIX_MONTHS) continue;
+
+          considered++;
+          // Belt-and-suspenders: keep the account on manual payouts.
+          try { await connectStripe.accounts.update(acc.id, { settings: { payouts: { schedule: { interval: 'manual' } } } }); } catch (_) {}
+          for (const b of buckets) {
+            const p = await connectStripe.payouts.create(
+              { amount: b.amount, currency: b.currency, statement_descriptor: 'TIP', metadata: { kind: 'auto-sweep-6mo', staffId: acc.metadata.staffId } },
+              hdr
+            );
+            swept.push({ account: acc.id, staffId: acc.metadata.staffId, amount: p.amount / 100, currency: p.currency });
+          }
+        } catch (e) { console.error('sweep acct', acc.id, e.message); }
+      }
+      if (!page.has_more) break;
+      starting_after = page.data[page.data.length - 1].id;
+    }
+
+    console.log(`sweep-idle: scanned=${scanned} considered=${considered} swept=${swept.length}`);
+    res.json({ ok: true, scanned, considered, swept });
+  } catch (e) { console.error('sweep-idle', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Release tips that were held while a worker hadn't finished connecting their

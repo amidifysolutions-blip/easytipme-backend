@@ -1834,6 +1834,10 @@ app.post('/connect/create-account', async (req, res) => {
         business_profile: { mcc: '7299', url: 'https://www.easytipme.com', product_description: 'Tips and gratuities received through EasyTipMe.' },
         individual: Object.keys(individual).length ? individual : undefined,
         capabilities: { transfers: { requested: true } },
+        // Manual payouts: money stays in the worker's balance until THEY cash out.
+        // Avoids automatic (salary-like) deposits — important for tipped workers,
+        // incl. those on a closed work permit. Worker controls timing via "Cash out".
+        settings: { payouts: { schedule: { interval: 'manual' } } },
         metadata: { bid, staffId }
       });
       accountId = acct.id;
@@ -1980,6 +1984,33 @@ app.post('/connect/balance', async (req, res) => {
       payouts
     });
   } catch (e) { console.error('connect balance', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Worker taps "Cash out" — pay the full available balance to their bank now.
+// Payouts are manual (no automatic schedule) and carry a short "TIP" descriptor so
+// the bank line reads as a tip rather than a salary. Only "available" funds move
+// (Stripe's short hold on pending funds still applies).
+app.post('/connect/withdraw', async (req, res) => {
+  try {
+    const { accountId } = req.body;
+    if (!accountId) return res.status(400).json({ error: 'missing accountId' });
+    const hdr = { stripeAccount: accountId };
+    // Defensive: guarantee this account is on manual payouts (older accounts may
+    // still be on the automatic default) so it never auto-deposits.
+    try { await connectStripe.accounts.update(accountId, { settings: { payouts: { schedule: { interval: 'manual' } } } }); } catch (_) {}
+    const bal = await connectStripe.balance.retrieve(hdr);
+    const buckets = (bal.available || []).filter(b => (b.amount || 0) > 0);
+    if (!buckets.length) return res.status(400).json({ error: 'no-available-funds' });
+    const payouts = [];
+    for (const b of buckets) {
+      const p = await connectStripe.payouts.create(
+        { amount: b.amount, currency: b.currency, statement_descriptor: 'TIP', metadata: { kind: 'worker-cashout' } },
+        hdr
+      );
+      payouts.push({ amount: p.amount / 100, currency: p.currency, status: p.status, arrival_date: p.arrival_date });
+    }
+    res.json({ ok: true, payouts });
+  } catch (e) { console.error('connect withdraw', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Release tips that were held while a worker hadn't finished connecting their

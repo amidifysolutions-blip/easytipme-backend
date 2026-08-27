@@ -2053,6 +2053,57 @@ app.post('/connect/withdraw', async (req, res) => {
   } catch (e) { console.error('connect withdraw', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ---- Partner program: application from the public /partners page ----------
+// Stores the application and emails the owner. Deliberately simple: the full
+// partner system (accounts, referral links, commission ledger) comes later —
+// this only makes the landing page's form real instead of decorative.
+app.post('/partners/apply', async (req, res) => {
+  try {
+    const esc = s => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const name = String(req.body.name || '').trim().slice(0, 80);
+    const email = String(req.body.email || '').trim().toLowerCase().slice(0, 120);
+    const country = String(req.body.country || '').trim().slice(0, 60);
+    const audience = String(req.body.audience || '').trim().slice(0, 500);
+    if (!name) return res.status(400).json({ error: 'missing-name' });
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'invalid-email' });
+
+    if (adminDb) {
+      const ref = adminDb.collection('partnerApplications').doc(email);
+      // Light anti-spam: ignore a repeat application from the same email inside
+      // an hour, but still answer OK so the visitor isn't told they failed.
+      const cur = await ref.get();
+      if (cur.exists && cur.data().createdMs && (Date.now() - cur.data().createdMs) < 3600000) {
+        return res.json({ ok: true, duplicate: true });
+      }
+      await ref.set({ name, email, country, audience, createdMs: Date.now(), status: 'new' }, { merge: true });
+    }
+
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    const notify = process.env.PARTNER_NOTIFY_EMAIL || senderEmail;
+    if (apiKey) {
+      const html = `<div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:auto;padding:24px;color:#1d1d1f">
+        <h2 style="margin:0 0 14px">New partner application</h2>
+        <p style="line-height:1.7;margin:0">
+          <b>Name:</b> ${esc(name)}<br>
+          <b>Email:</b> ${esc(email)}<br>
+          <b>Country:</b> ${esc(country) || '—'}<br>
+          <b>How they'll share:</b> ${esc(audience) || '—'}
+        </p>
+        <p style="font-size:12px;color:#9a9aa0;margin-top:20px">Sent from the EasyTipMe partners page.</p>
+      </div>`;
+      try {
+        await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: notify }], replyTo: { email }, subject: 'New partner application — ' + name, htmlContent: html })
+        });
+      } catch (_) {}
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('partners apply', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Safety-net auto-sweep (hidden backstop, NOT shown in the app).
 // Purpose: money must never sit stuck in a worker's Connect balance forever — if
 // a worker forgets, abandons the account, or passes away, an idle balance is

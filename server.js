@@ -176,7 +176,7 @@ app.post('/create-payment-intent', async (req, res) => {
     // (especially in currencies that get no fixed fee — see MAJOR_CUR below).
     // The minimum is per CURRENCY: "3" means $3 in CAD/USD, but 3 AED is under a
     // dollar, so each currency gets its own floor sized to that currency. Set
-    // config/platform.minTipByCurrency = { aed: 5, sar: 5, ... } to override.
+    // config/platform.minTipByCurrency = { sek: 30, pln: 12, ... } to override.
     const curKey = String(cur || '').toLowerCase();
     const minByCur = (cfgData.minTipByCurrency && typeof cfgData.minTipByCurrency === 'object') ? cfgData.minTipByCurrency : {};
     const MINOR_CUR_DEFAULT = { sek: 30, nok: 30, dkk: 20, pln: 12, czk: 70, huf: 1000, ron: 14, bgn: 6 };

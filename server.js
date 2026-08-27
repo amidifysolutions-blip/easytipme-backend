@@ -1775,6 +1775,9 @@ app.post('/send-reset', async (req, res) => {
 // (transfers/instant payouts + tiered fees) is intentionally NOT enabled here
 // yet — that is added AFTER Connect is enabled in the dashboard and tested.
 const adminDb = adminAuth ? require('firebase-admin').firestore() : null;
+// Module-level handle so FieldValue works outside the functions that require()
+// firebase-admin locally (increment/delete are used by the partner endpoints).
+const FieldValue = adminDb ? require('firebase-admin').firestore.FieldValue : null;
 
 // ---- One Stripe payout account per worker, reused across ALL their workplaces ----
 // The account is remembered under workers/{uid}; every shop's staff doc mirrors it
@@ -2113,6 +2116,344 @@ app.post('/partners/apply', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { console.error('partners apply', e.message); res.status(500).json({ error: e.message }); }
 });
+
+// ============================ PARTNER PROGRAM ==============================
+// A partner refers venues and earns a recurring share of the NET revenue those
+// venues generate for us (net = after Stripe). Rates: 20% / 25% / 30%, tiers
+// upgrade automatically at 25 and 200 active venues, and the rate steps down
+// 7 points per 6 months without a new paying venue, never below 10%.
+const PARTNER_TIERS = [
+  { name: 'Starter', min: 0, rate: 20 },
+  { name: 'Pro', min: 25, rate: 25 },
+  { name: 'Diamond', min: 200, rate: 30 },
+];
+const PARTNER_RATE_FLOOR = 10;
+const PARTNER_STEP_DOWN = 7;              // percentage points per idle period
+const PARTNER_IDLE_MS = 183 * 24 * 3600 * 1000;  // ~6 months
+const PARTNER_MIN_PAYOUT_CENTS = 1000;    // $10
+
+// Effective rate for a partner: tier by active venues, minus the idle step-down,
+// unless an explicit custom rate has been set for them.
+function partnerRateFor(p) {
+  if (p && p.customRate != null && !isNaN(Number(p.customRate))) {
+    return { rate: Number(p.customRate), tier: 'Custom', baseRate: Number(p.customRate), steps: 0 };
+  }
+  const active = Number((p && p.activeClients) || 0);
+  let tier = PARTNER_TIERS[0];
+  for (const t of PARTNER_TIERS) if (active >= t.min) tier = t;
+  // Idle clock runs from the last NEW paying venue (or from joining).
+  const since = Number((p && (p.lastReferralMs || p.createdMs)) || Date.now());
+  const steps = Math.max(0, Math.floor((Date.now() - since) / PARTNER_IDLE_MS));
+  const rate = Math.max(PARTNER_RATE_FLOOR, tier.rate - steps * PARTNER_STEP_DOWN);
+  return { rate, tier: tier.name, baseRate: tier.rate, steps };
+}
+
+// Short, unambiguous referral code (no look-alike characters).
+function makePartnerCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = ''; for (let i = 0; i < 7; i++) s += A[Math.floor(Math.random() * A.length)];
+  return s;
+}
+
+async function requirePartner(req, res) {
+  if (!adminAuth || !adminDb) { res.status(500).json({ error: 'admin-not-configured' }); return null; }
+  const idToken = req.body && req.body.idToken;
+  if (!idToken) { res.status(400).json({ error: 'missing idToken' }); return null; }
+  let decoded;
+  try { decoded = await adminAuth.verifyIdToken(idToken); }
+  catch (_) { res.status(401).json({ error: 'bad-token' }); return null; }
+  return decoded;
+}
+
+// Create the partner record for the signed-in user (idempotent).
+app.post('/partners/register', async (req, res) => {
+  try {
+    const decoded = await requirePartner(req, res); if (!decoded) return;
+    const uid = decoded.uid;
+    const ref = adminDb.collection('partners').doc(uid);
+    const snap = await ref.get();
+    if (snap.exists) return res.json({ ok: true, code: snap.data().code, existing: true });
+
+    // Reserve a unique code.
+    let code = null;
+    for (let i = 0; i < 8 && !code; i++) {
+      const c = makePartnerCode();
+      const cRef = adminDb.collection('partnerCodes').doc(c);
+      // eslint-disable-next-line no-await-in-loop
+      const taken = await cRef.get();
+      if (!taken.exists) { await cRef.set({ uid, createdMs: Date.now() }); code = c; }
+    }
+    if (!code) return res.status(500).json({ error: 'code-generation-failed' });
+
+    const now = Date.now();
+    await ref.set({
+      uid, code,
+      name: String((req.body && req.body.name) || decoded.name || '').slice(0, 80),
+      email: (decoded.email || '').toLowerCase(),
+      country: String((req.body && req.body.country) || '').slice(0, 60),
+      status: 'active', createdMs: now, lastReferralMs: null,
+      activeClients: 0, totalReferred: 0, accruedCents: 0, paidCents: 0,
+    });
+    res.json({ ok: true, code });
+  } catch (e) { console.error('partners register', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Everything the partner dashboard shows.
+app.post('/partners/me', async (req, res) => {
+  try {
+    const decoded = await requirePartner(req, res); if (!decoded) return;
+    const snap = await adminDb.collection('partners').doc(decoded.uid).get();
+    if (!snap.exists) return res.json({ ok: true, registered: false });
+    const p = snap.data();
+    const r = partnerRateFor(p);
+
+    // The venues credited to this partner.
+    const referrals = [];
+    try {
+      const q = await adminDb.collection('businesses').where('partnerUid', '==', decoded.uid).get();
+      q.forEach(d => {
+        const b = d.data();
+        referrals.push({
+          id: d.id,
+          name: b.businessName || '—',
+          joinedMs: b.partnerLockedMs || null,
+          active: b.blocked !== true,
+        });
+      });
+    } catch (_) {}
+
+    // Recent commission lines.
+    const ledger = [];
+    try {
+      const lq = await adminDb.collection('partners').doc(decoded.uid).collection('ledger')
+        .orderBy('createdMs', 'desc').limit(24).get();
+      lq.forEach(d => { const x = d.data(); ledger.push({ period: x.period, commission: (x.commissionCents || 0) / 100, rate: x.rate, status: x.status || 'accrued' }); });
+    } catch (_) {}
+
+    // Idle step-down: when does the rate drop next?
+    const since = Number(p.lastReferralMs || p.createdMs || Date.now());
+    const nextStepMs = since + (r.steps + 1) * PARTNER_IDLE_MS;
+
+    res.json({
+      ok: true, registered: true,
+      code: p.code, name: p.name || '', email: p.email || '', status: p.status || 'active',
+      tier: r.tier, rate: r.rate, baseRate: r.baseRate, stepsDown: r.steps,
+      nextStepDownMs: r.rate > PARTNER_RATE_FLOOR ? nextStepMs : null,
+      activeClients: referrals.filter(x => x.active).length,
+      totalReferred: referrals.length,
+      accrued: (p.accruedCents || 0) / 100,
+      paid: (p.paidCents || 0) / 100,
+      minPayout: PARTNER_MIN_PAYOUT_CENTS / 100,
+      payoutMethod: p.payoutMethod || null,
+      stripeReady: !!p.stripePayoutsEnabled,
+      link: APP_URL + '/signup.html?ref=' + p.code,
+      referrals, ledger,
+    });
+  } catch (e) { console.error('partners me', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Credit a newly registered business to a partner. Called once, at signup, with
+// the ?ref= code the visitor arrived on. Locked to the first partner only.
+app.post('/partners/attribute', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
+    const { idToken, code } = req.body;
+    if (!idToken || !code) return res.status(400).json({ error: 'missing-fields' });
+    let decoded;
+    try { decoded = await adminAuth.verifyIdToken(idToken); } catch (_) { return res.status(401).json({ error: 'bad-token' }); }
+    const bid = decoded.uid;
+
+    const cSnap = await adminDb.collection('partnerCodes').doc(String(code).toUpperCase().trim()).get();
+    if (!cSnap.exists) return res.json({ ok: true, credited: false });     // unknown code — ignore quietly
+    const partnerUid = cSnap.data().uid;
+    if (partnerUid === bid) return res.json({ ok: true, credited: false }); // no self-referral
+
+    const bRef = adminDb.collection('businesses').doc(bid);
+    const bSnap = await bRef.get();
+    if (!bSnap.exists) return res.json({ ok: true, credited: false });
+    if (bSnap.data().partnerUid) return res.json({ ok: true, credited: false }); // already credited — never reassign
+
+    const now = Date.now();
+    await bRef.update({ partnerUid, partnerCode: cSnap.id, partnerLockedMs: now });
+    const pRef = adminDb.collection('partners').doc(partnerUid);
+    await pRef.update({
+      totalReferred: FieldValue.increment(1),
+      activeClients: FieldValue.increment(1),
+      lastReferralMs: now,   // restores the full tier rate
+    });
+    res.json({ ok: true, credited: true });
+  } catch (e) { console.error('partners attribute', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Stripe Connect for the partner's own payouts (same rails as worker payouts).
+app.post('/partners/connect', async (req, res) => {
+  try {
+    const decoded = await requirePartner(req, res); if (!decoded) return;
+    const ref = adminDb.collection('partners').doc(decoded.uid);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(400).json({ error: 'not-a-partner' });
+    const p = snap.data();
+    let accountId = p.stripeAccountId || null;
+    if (accountId) {
+      try { await connectStripe.accounts.retrieve(accountId); }
+      catch (_) { accountId = null; }   // stale id (e.g. test→live switch)
+    }
+    if (!accountId) {
+      const acct = await connectStripe.accounts.create({
+        type: 'express',
+        email: p.email || decoded.email || undefined,
+        country: String(req.body.country || p.country || 'CA').toUpperCase().slice(0, 2),
+        capabilities: { transfers: { requested: true } },
+        business_type: 'individual',
+        metadata: { partnerUid: decoded.uid, kind: 'partner' },
+      });
+      accountId = acct.id;
+      await ref.update({ stripeAccountId: accountId });
+    }
+    const base = APP_URL + '/partner.html';
+    const link = await connectStripe.accountLinks.create({
+      account: accountId,
+      refresh_url: base + '?connect=refresh',
+      return_url: base + '?connect=done',
+      type: 'account_onboarding',
+    });
+    res.json({ ok: true, url: link.url, accountId });
+  } catch (e) { console.error('partners connect', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Refresh whether the partner's Stripe account can actually receive payouts.
+app.post('/partners/connect-status', async (req, res) => {
+  try {
+    const decoded = await requirePartner(req, res); if (!decoded) return;
+    const ref = adminDb.collection('partners').doc(decoded.uid);
+    const snap = await ref.get();
+    const accountId = snap.exists && snap.data().stripeAccountId;
+    if (!accountId) return res.json({ ok: true, ready: false });
+    const a = await connectStripe.accounts.retrieve(accountId);
+    const ready = !!((a.capabilities && a.capabilities.transfers === 'active') || a.payouts_enabled);
+    await ref.update({ stripePayoutsEnabled: ready });
+    res.json({ ok: true, ready });
+  } catch (e) { console.error('partners connect-status', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Manual payout method for countries Stripe does not reach.
+app.post('/partners/payout-details', async (req, res) => {
+  try {
+    const decoded = await requirePartner(req, res); if (!decoded) return;
+    const type = String((req.body && req.body.type) || '').toLowerCase();
+    const ALLOWED = ['usdt', 'wise', 'western-union', 'bank'];
+    if (!ALLOWED.includes(type)) return res.status(400).json({ error: 'bad-type' });
+    const details = String((req.body && req.body.details) || '').trim().slice(0, 400);
+    if (!details) return res.status(400).json({ error: 'missing-details' });
+    await adminDb.collection('partners').doc(decoded.uid).update({
+      payoutMethod: { type, details, updatedMs: Date.now() },
+    });
+    res.json({ ok: true });
+  } catch (e) { console.error('partners payout-details', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Monthly commission accrual. For each venue that has a partner, work out what
+// we ACTUALLY kept last month (gross commission minus Stripe's cut, plus the $2
+// worker fees, which carry no card cost) and credit the partner's share of that.
+// Writing to a fixed doc id per partner+period makes this safe to re-run.
+const STRIPE_PCT = 0.029, STRIPE_FIXED_CENTS = 30;
+function periodKey(d) { return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0'); }
+
+async function accruePartnerCommissions(period) {
+  if (!adminDb) return { ok: false, error: 'admin-not-configured' };
+  // Default to the month that just ended.
+  const now = new Date();
+  const target = period || periodKey(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
+  const [py, pm] = target.split('-').map(Number);
+  const start = Date.UTC(py, pm - 1, 1), end = Date.UTC(py, pm, 1);
+
+  // Only venues that belong to a partner.
+  const bizSnap = await adminDb.collection('businesses').where('partnerUid', '!=', null).get();
+  const byPartner = {};      // partnerUid -> net cents earned from their venues
+  let venues = 0;
+
+  for (const b of bizSnap.docs) {
+    const biz = b.data();
+    const partnerUid = biz.partnerUid;
+    if (!partnerUid) continue;
+    venues++;
+    let netCents = 0;
+    try {
+      const tips = await adminDb.collection('businesses').doc(b.id).collection('tips').get();
+      tips.forEach(t => {
+        const x = t.data();
+        const ms = (x.createdAt && x.createdAt.toMillis) ? x.createdAt.toMillis() : 0;
+        if (ms < start || ms >= end) return;
+        const tipC = Math.round(Number(x.tip || 0) * 100);
+        const feeC = Math.round(Number(x.fee || 0) * 100);
+        if (feeC <= 0) return;
+        // What Stripe took from the whole charge, and what we were left with.
+        const stripeC = Math.round(STRIPE_PCT * (tipC + feeC)) + STRIPE_FIXED_CENTS;
+        netCents += (feeC - stripeC);
+        // The $2 active-account fee is deducted from the worker's transfer, so it
+        // carries no card processing cost — it is ours in full.
+        netCents += Math.round(Number(x.monthlyFee || 0) * 100);
+      });
+    } catch (e) { console.error('accrue tips', b.id, e.message); }
+    if (netCents > 0) byPartner[partnerUid] = (byPartner[partnerUid] || 0) + netCents;
+  }
+
+  const results = [];
+  for (const uid of Object.keys(byPartner)) {
+    try {
+      const pRef = adminDb.collection('partners').doc(uid);
+      const pSnap = await pRef.get();
+      if (!pSnap.exists) continue;
+      const p = pSnap.data();
+      if (p.status === 'suspended') continue;   // suspended partners accrue nothing
+      const { rate } = partnerRateFor(p);
+      const netCents = byPartner[uid];
+      const commissionCents = Math.round(netCents * rate / 100);
+      if (commissionCents <= 0) continue;
+
+      const lRef = pRef.collection('ledger').doc(target);
+      const prev = await lRef.get();
+      const prevAmount = prev.exists ? Number(prev.data().commissionCents || 0) : 0;
+      await lRef.set({
+        period: target, netCents, rate, commissionCents,
+        createdMs: Date.now(), status: 'accrued',
+      }, { merge: true });
+      // Re-running only ever adjusts by the difference, never double-credits.
+      const delta = commissionCents - prevAmount;
+      if (delta !== 0) await pRef.update({ accruedCents: FieldValue.increment(delta) });
+      results.push({ uid, period: target, netCents, rate, commissionCents, delta });
+    } catch (e) { console.error('accrue partner', uid, e.message); }
+  }
+  console.log('partner-accrual', target, 'venues=' + venues, 'partners=' + results.length);
+  return { ok: true, period: target, venues, credited: results };
+}
+
+// Manual/admin trigger (same secret as the sweep).
+app.post('/partners/accrue', async (req, res) => {
+  try {
+    const secret = req.headers['x-cron-secret'] || (req.body && req.body.secret);
+    if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) return res.status(403).json({ error: 'forbidden' });
+    res.json(await accruePartnerCommissions(req.body && req.body.period));
+  } catch (e) { console.error('partners accrue', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Runs itself: once a day the server checks whether last month has been accrued
+// yet, and if not, does it. Writing to a per-period doc keeps this idempotent.
+let _lastAccrualCheckMs = 0;
+async function maybeAccrue() {
+  if (Date.now() - _lastAccrualCheckMs < 24 * 3600 * 1000) return;
+  _lastAccrualCheckMs = Date.now();
+  try {
+    const now = new Date();
+    const target = periodKey(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1)));
+    const marker = adminDb && await adminDb.collection('config').doc('partnerAccrual').get();
+    if (marker && marker.exists && marker.data().lastPeriod === target) return;   // already done
+    const r = await accruePartnerCommissions(target);
+    if (r.ok && adminDb) await adminDb.collection('config').doc('partnerAccrual').set({ lastPeriod: target, ranMs: Date.now() }, { merge: true });
+  } catch (e) { console.error('auto-accrual', e && e.message); }
+}
+setTimeout(maybeAccrue, 7 * 60 * 1000);
+setInterval(maybeAccrue, 6 * 3600 * 1000);
 
 // Safety-net auto-sweep (hidden backstop, NOT shown in the app).
 // Purpose: money must never sit stuck in a worker's Connect balance forever — if

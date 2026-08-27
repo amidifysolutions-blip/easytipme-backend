@@ -194,50 +194,77 @@ app.post('/create-payment-intent', async (req, res) => {
     let MIN_COMM_PCT = 10;
     if (cfgData.minCommissionPercent != null && !isNaN(Number(cfgData.minCommissionPercent))) MIN_COMM_PCT = Number(cfgData.minCommissionPercent);
 
-    // ---- Per-currency pricing -------------------------------------------------
-    // Stripe charges a PERCENTAGE plus a FIXED amount on every charge, and the
-    // fixed amount exists in every country. So we must recover it in every
-    // currency, not only the launch four. (It used to be zeroed outside
-    // CAD/USD/EUR/GBP, which made small tips abroad a guaranteed loss.)
+    // ---- Pricing model: Stripe's real cost + a fixed net profit ---------------
+    // The customer pays the tip, PLUS exactly what Stripe costs us, PLUS our
+    // margin. Solving  A - (sp*(T+A) + F) = m*T  gives:
+    //     rate  = (m + sp) / (1 - sp)          fixed = F / (1 - sp)
+    // so the margin is a true NET percentage of the tip in every country.
     //
-    // Amounts below are ~C$0.40 expressed in each currency, rounded up so FX
-    // drift never eats the margin. Override any value, or add a currency, from
-    // the admin panel: config/platform.commissionFixedByCurrency.
-    const FIXED_BY_CUR = {
-      cad: 0.40, usd: 0.40, eur: 0.35, gbp: 0.30, aud: 0.45, nzd: 0.50, chf: 0.30,
-      aed: 1.50, sar: 1.50, qar: 1.50, jod: 0.30, kwd: 0.15, bhd: 0.15, omr: 0.15,
-      egp: 15, lbp: 30000, try: 15, mad: 4, tnd: 1.5, ils: 1.5,
-      sek: 4, nok: 4, dkk: 3, pln: 1.5, czk: 9, ron: 2, huf: 130, isk: 55,
-      jpy: 50, cny: 3, hkd: 3, twd: 12, krw: 500, sgd: 0.40, myr: 1.5,
-      thb: 12, php: 20, idr: 5000, inr: 30, vnd: 8000, pkr: 90, bdt: 40,
-      brl: 2, mxn: 6, ars: 400, clp: 300, cop: 1200, pen: 1.2, uyu: 12,
-      zar: 6, ngn: 500, kes: 40, ghs: 4,
+    // Stripe's cost is NOT the same everywhere: the platform account is Canadian,
+    // so a CAD charge on a local card is 2.9% + C$0.30, but any other currency
+    // adds 0.8% (foreign card) + 2% (currency conversion) = 5.7% + C$0.30.
+    const HOME_CUR = String(cfgData.homeCurrency || 'cad').toLowerCase();
+    const TARGET_NET = (cfgData.targetNetPercent != null && !isNaN(Number(cfgData.targetNetPercent))) ? Number(cfgData.targetNetPercent) : 7;
+    const SP_HOME = (cfgData.stripePercentHome != null && !isNaN(Number(cfgData.stripePercentHome))) ? Number(cfgData.stripePercentHome) : 2.9;
+    const SP_AWAY = (cfgData.stripePercentForeign != null && !isNaN(Number(cfgData.stripePercentForeign))) ? Number(cfgData.stripePercentForeign) : 5.7;
+
+    // What Stripe's FIXED fee (C$0.30) costs us, expressed in each currency.
+    // Approximate for markets we have not launched in yet — verify against a real
+    // Balance transaction before opening a market, and override any value from the
+    // admin panel (config/platform.commissionFixedByCurrency sets the CHARGED
+    // amount directly and skips this maths entirely).
+    const STRIPE_FIXED_BY_CUR = {
+      cad: 0.30, usd: 0.22, eur: 0.20, gbp: 0.17, aud: 0.34, nzd: 0.37, chf: 0.19,
+      aed: 0.80, sar: 0.82, qar: 0.80, jod: 0.16, kwd: 0.07, bhd: 0.09, omr: 0.09,
+      egp: 10.5, lbp: 19500, try: 9, mad: 2.2, tnd: 0.65, ils: 0.81,
+      sek: 2.2, nok: 2.3, dkk: 1.5, pln: 0.87, czk: 4.8, ron: 1.0, huf: 78, isk: 30,
+      jpy: 33, cny: 1.55, hkd: 1.7, twd: 6.9, krw: 300, sgd: 0.28, myr: 0.93,
+      thb: 7.5, php: 12.5, idr: 3600, inr: 18.5, vnd: 5550, pkr: 62, bdt: 26,
+      brl: 1.2, mxn: 4.2, ars: 300, clp: 210, cop: 870, pen: 0.81, uyu: 8.7,
+      zar: 3.9, ngn: 330, kes: 28.5, ghs: 2.7,
     };
-    // Optional per-currency commission rate (e.g. { aed: 16 }) for markets where
-    // Stripe costs more than at home (foreign card +0.8%, FX conversion +2%).
-    // Empty by default -> every currency keeps the global rate.
+    // Round a money amount UP to ~2 significant figures, so FX drift is absorbed
+    // by us charging a hair more, never by us quietly losing money.
+    function tidyUp(v) {
+      if (!(v > 0)) return 0;
+      const mag = Math.pow(10, Math.floor(Math.log10(v)) - 1);
+      return Math.round(Math.ceil(v / mag) * mag * 1e6) / 1e6;
+    }
+    const isHome = (cur === HOME_CUR);
+    const sp = (isHome ? SP_HOME : SP_AWAY) / 100;
+    const costPlusPct = Math.round(((TARGET_NET / 100 + sp) / (1 - sp)) * 1000) / 10;
+    const stripeFixedHere = STRIPE_FIXED_BY_CUR[cur];
+    const costPlusFixed = (stripeFixedHere != null) ? tidyUp(stripeFixedHere / (1 - sp)) : null;
+
     const pctByCur = (cfgData.commissionPercentByCurrency && typeof cfgData.commissionPercentByCurrency === 'object') ? cfgData.commissionPercentByCurrency : {};
     const fixedByCur = (cfgData.commissionFixedByCurrency && typeof cfgData.commissionFixedByCurrency === 'object') ? cfgData.commissionFixedByCurrency : {};
 
+    // Floor. Away from home the floor is the cost-plus rate itself, so no shop can
+    // be configured onto a rate that quietly earns less than TARGET_NET abroad.
+    if (!isHome && costPlusPct > MIN_COMM_PCT) MIN_COMM_PCT = costPlusPct;
+
+    // Rate: per-shop > per-currency override > cost-plus (away) > global > floor.
     let commPct = null;
     if (biz.commissionPercent != null && !isNaN(Number(biz.commissionPercent))) commPct = Number(biz.commissionPercent);
     else if (pctByCur[cur] != null && !isNaN(Number(pctByCur[cur]))) commPct = Number(pctByCur[cur]);
+    else if (!isHome) commPct = costPlusPct;
     else if (cfgData.commissionPercent != null) commPct = Number(cfgData.commissionPercent);
     if (commPct == null || !(commPct >= 0)) commPct = MIN_COMM_PCT;
     if (commPct < MIN_COMM_PCT) commPct = MIN_COMM_PCT;
 
-    let commFixed = null;   // in the tip's currency units (e.g. 0.30 = $0.30)
+    // Fixed fee: same precedence. It exists in EVERY currency, sized to that
+    // currency — a flat "0.40" would be meaningless in dirhams or pounds sterling.
+    let commFixed = null;
     if (biz.commissionFixed != null && !isNaN(Number(biz.commissionFixed))) commFixed = Number(biz.commissionFixed);
+    else if (fixedByCur[cur] != null && !isNaN(Number(fixedByCur[cur]))) commFixed = Number(fixedByCur[cur]);
+    else if (!isHome && costPlusFixed != null) commFixed = costPlusFixed;
     else if (cfgData.commissionFixed != null) commFixed = Number(cfgData.commissionFixed);
-    if (commFixed == null || !(commFixed >= 0)) commFixed = 0.30;
+    if (commFixed == null || !(commFixed >= 0)) commFixed = (costPlusFixed != null ? costPlusFixed : 0.30);
 
-    // isMajor now only gates the flat $2 monthly WORKER fee (a dollar amount that
-    // would be nonsense in other currencies). The customer-facing fixed fee is
-    // charged in EVERY currency, from the table above.
+    // isMajor now ONLY gates the flat $2 monthly WORKER fee, which is a dollar
+    // amount and would be nonsense in other currencies.
     const MAJOR_CUR = ['usd', 'cad', 'eur', 'gbp'];
     const isMajor = MAJOR_CUR.includes(cur);
-    if (fixedByCur[cur] != null && !isNaN(Number(fixedByCur[cur]))) commFixed = Number(fixedByCur[cur]);
-    else if (!isMajor) commFixed = (FIXED_BY_CUR[cur] != null) ? FIXED_BY_CUR[cur] : 0;
 
     const commission = Math.round(tip * commPct / 100) + Math.round(commFixed * 100);  // cents; platform keeps this
     const total = tip + commission;                                                     // customer pays this

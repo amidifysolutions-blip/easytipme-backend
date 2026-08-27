@@ -2697,7 +2697,7 @@ app.post('/mgr/members/remove', async (req, res) => {
 function loginCodeHtml(code) {
   return emailShell(`<div style="text-align:center">
     <div style="font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.02em;">Your sign-in code</div>
-    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 10px;">Enter this code at easytipme.com/manage.html to sign in:</p>
+    <p style="font-size:15px;color:#333;line-height:1.6;margin:14px 0 10px;">Enter this code on the sign-in page to continue:</p>
     <div style="font-size:34px;font-weight:800;letter-spacing:8px;color:#0071e3;background:#f2f7ff;border-radius:14px;padding:16px 0;margin:0 0 10px;">${escapeHtml(code)}</div>
     <p style="font-size:12px;color:#9a9aa0;line-height:1.6;margin:10px 0 0;">This code expires in 15 minutes. If you didn't request it, you can ignore this email.</p>
   </div>`);
@@ -2706,6 +2706,45 @@ async function emailHasManagerAccess(addr) {
   try { const q = await adminDb.collectionGroup('members').where('email', '==', addr).limit(1).get(); return !q.empty; }
   catch (_) { return false; }
 }
+
+// ---- Passwordless sign-in for EVERYONE (worker, owner, manager) -------------
+// Same idea as the manager code login, but open to anyone who already belongs
+// here: an existing account, or a worker who was added to a shop's team but has
+// not signed in yet. Entering the code proves the address, so the account comes
+// out emailVerified with no separate verification step and no password at all.
+async function emailIsKnown(addr) {
+  try { await adminAuth.getUserByEmail(addr); return true; } catch (_) {}
+  try { const q = await adminDb.collectionGroup('staff').where('email', '==', addr).limit(1).get(); if (!q.empty) return true; } catch (_) {}
+  return await emailHasManagerAccess(addr);
+}
+
+app.post('/auth/login/request', async (req, res) => {
+  try {
+    if (!adminAuth || !adminDb) return res.json({ ok: false, error: 'admin-not-configured' });
+    const addr = String((req.body && req.body.email) || '').toLowerCase().trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(addr)) return res.json({ ok: true });
+    // Always answer ok so the response never reveals whether an account exists.
+    if (!(await emailIsKnown(addr))) return res.json({ ok: true });
+    const ref = adminDb.collection('loginCodes').doc(addr);
+    const now = Date.now();
+    const cur = await ref.get();
+    if (cur.exists && cur.data().lastSentMs && (now - cur.data().lastSentMs) < 25000) return res.json({ ok: true });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await ref.set({ code, email: addr, expMs: now + 15 * 60000, tries: 0, lastSentMs: now });
+    const apiKey = process.env.BREVO_API_KEY;
+    const senderEmail = process.env.SENDER_EMAIL || 'info@easytipme.com';
+    const senderName = process.env.SENDER_NAME || 'EasyTipMe';
+    if (apiKey) {
+      try {
+        await fetch('https://api.brevo.com/v3/smtp/email', {
+          method: 'POST', headers: { 'api-key': apiKey, 'content-type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({ sender: { name: senderName, email: senderEmail }, to: [{ email: addr }], subject: 'Your EasyTipMe sign-in code', htmlContent: loginCodeHtml(code) })
+        });
+      } catch (_) {}
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error('auth login request', e.message); res.json({ ok: false, error: e.message }); }
+});
 app.post('/mgr/login/request', async (req, res) => {
   try {
     if (!adminAuth || !adminDb) return res.json({ ok: false, error: 'admin-not-configured' });
@@ -2734,7 +2773,9 @@ app.post('/mgr/login/request', async (req, res) => {
     res.json({ ok: true });
   } catch (e) { console.error('mgr login request', e.message); res.json({ ok: false, error: e.message }); }
 });
-app.post('/mgr/login/verify', async (req, res) => {
+// One verifier for both entry points — it only checks the code, so it is safe
+// to share: codes are only ever issued by the gated /request routes above.
+app.post(['/mgr/login/verify', '/auth/login/verify'], async (req, res) => {
   try {
     if (!adminAuth || !adminDb) return res.status(500).json({ error: 'admin-not-configured' });
     const addr = String((req.body && req.body.email) || '').toLowerCase().trim();

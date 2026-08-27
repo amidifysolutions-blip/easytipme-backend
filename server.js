@@ -175,12 +175,11 @@ app.post('/create-payment-intent', async (req, res) => {
     // below the minimum can cost more in Stripe fees than the commission earns
     // (especially in currencies that get no fixed fee — see MAJOR_CUR below).
     // The minimum is per CURRENCY: "3" means $3 in CAD/USD, but 3 AED is under a
-    // dollar and still loses money after Stripe's fixed fee. Currencies without
-    // our fixed fee (see MAJOR_CUR below) therefore need a higher floor. Set
-    // config/platform.minTipByCurrency = { aed: 12, sar: 12, ... } to override.
+    // dollar, so each currency gets its own floor sized to that currency. Set
+    // config/platform.minTipByCurrency = { aed: 5, sar: 5, ... } to override.
     const curKey = String(cur || '').toLowerCase();
     const minByCur = (cfgData.minTipByCurrency && typeof cfgData.minTipByCurrency === 'object') ? cfgData.minTipByCurrency : {};
-    const MINOR_CUR_DEFAULT = { aed: 12, sar: 12, qar: 12, lbp: 300000, egp: 150 };
+    const MINOR_CUR_DEFAULT = { aed: 5, sar: 5, qar: 5, lbp: 100000, egp: 50 };
     let minTipUnits;
     if (minByCur[curKey] != null && !isNaN(Number(minByCur[curKey]))) minTipUnits = Number(minByCur[curKey]);
     else if (MINOR_CUR_DEFAULT[curKey] != null) minTipUnits = MINOR_CUR_DEFAULT[curKey];
@@ -195,8 +194,34 @@ app.post('/create-payment-intent', async (req, res) => {
     let MIN_COMM_PCT = 10;
     if (cfgData.minCommissionPercent != null && !isNaN(Number(cfgData.minCommissionPercent))) MIN_COMM_PCT = Number(cfgData.minCommissionPercent);
 
+    // ---- Per-currency pricing -------------------------------------------------
+    // Stripe charges a PERCENTAGE plus a FIXED amount on every charge, and the
+    // fixed amount exists in every country. So we must recover it in every
+    // currency, not only the launch four. (It used to be zeroed outside
+    // CAD/USD/EUR/GBP, which made small tips abroad a guaranteed loss.)
+    //
+    // Amounts below are ~C$0.40 expressed in each currency, rounded up so FX
+    // drift never eats the margin. Override any value, or add a currency, from
+    // the admin panel: config/platform.commissionFixedByCurrency.
+    const FIXED_BY_CUR = {
+      cad: 0.40, usd: 0.40, eur: 0.35, gbp: 0.30, aud: 0.45, nzd: 0.50, chf: 0.30,
+      aed: 1.50, sar: 1.50, qar: 1.50, jod: 0.30, kwd: 0.15, bhd: 0.15, omr: 0.15,
+      egp: 15, lbp: 30000, try: 15, mad: 4, tnd: 1.5, ils: 1.5,
+      sek: 4, nok: 4, dkk: 3, pln: 1.5, czk: 9, ron: 2, huf: 130, isk: 55,
+      jpy: 50, cny: 3, hkd: 3, twd: 12, krw: 500, sgd: 0.40, myr: 1.5,
+      thb: 12, php: 20, idr: 5000, inr: 30, vnd: 8000, pkr: 90, bdt: 40,
+      brl: 2, mxn: 6, ars: 400, clp: 300, cop: 1200, pen: 1.2, uyu: 12,
+      zar: 6, ngn: 500, kes: 40, ghs: 4,
+    };
+    // Optional per-currency commission rate (e.g. { aed: 16 }) for markets where
+    // Stripe costs more than at home (foreign card +0.8%, FX conversion +2%).
+    // Empty by default -> every currency keeps the global rate.
+    const pctByCur = (cfgData.commissionPercentByCurrency && typeof cfgData.commissionPercentByCurrency === 'object') ? cfgData.commissionPercentByCurrency : {};
+    const fixedByCur = (cfgData.commissionFixedByCurrency && typeof cfgData.commissionFixedByCurrency === 'object') ? cfgData.commissionFixedByCurrency : {};
+
     let commPct = null;
     if (biz.commissionPercent != null && !isNaN(Number(biz.commissionPercent))) commPct = Number(biz.commissionPercent);
+    else if (pctByCur[cur] != null && !isNaN(Number(pctByCur[cur]))) commPct = Number(pctByCur[cur]);
     else if (cfgData.commissionPercent != null) commPct = Number(cfgData.commissionPercent);
     if (commPct == null || !(commPct >= 0)) commPct = MIN_COMM_PCT;
     if (commPct < MIN_COMM_PCT) commPct = MIN_COMM_PCT;
@@ -206,13 +231,13 @@ app.post('/create-payment-intent', async (req, res) => {
     else if (cfgData.commissionFixed != null) commFixed = Number(cfgData.commissionFixed);
     if (commFixed == null || !(commFixed >= 0)) commFixed = 0.30;
 
-    // Flat amounts (fixed fee, $2 monthly fee) only make sense in currencies of a
-    // similar scale. We apply them for the launch currencies (USD/CAD/EUR/GBP);
-    // exotic-value currencies get the percentage only until we add per-currency
-    // amounts. This keeps a "2"-sized flat fee from being nonsense elsewhere.
+    // isMajor now only gates the flat $2 monthly WORKER fee (a dollar amount that
+    // would be nonsense in other currencies). The customer-facing fixed fee is
+    // charged in EVERY currency, from the table above.
     const MAJOR_CUR = ['usd', 'cad', 'eur', 'gbp'];
     const isMajor = MAJOR_CUR.includes(cur);
-    if (!isMajor) commFixed = 0;
+    if (fixedByCur[cur] != null && !isNaN(Number(fixedByCur[cur]))) commFixed = Number(fixedByCur[cur]);
+    else if (!isMajor) commFixed = (FIXED_BY_CUR[cur] != null) ? FIXED_BY_CUR[cur] : 0;
 
     const commission = Math.round(tip * commPct / 100) + Math.round(commFixed * 100);  // cents; platform keeps this
     const total = tip + commission;                                                     // customer pays this

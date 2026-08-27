@@ -1999,7 +1999,7 @@ app.post('/connect/withdraw', async (req, res) => {
     // still be on the automatic default) so it never auto-deposits.
     try { await connectStripe.accounts.update(accountId, { settings: { payouts: { schedule: { interval: 'manual' } } } }); } catch (_) {}
 
-    // INSTANT (~30 min): worker pays a 5% fee (set as our platform instant-payout
+    // INSTANT (~30 min): worker pays a 7% fee (set as our platform instant-payout
     // pricing in Stripe). net_available = what the worker receives after that fee;
     // Stripe collects ~1% and the platform keeps the rest. Requires an eligible
     // instant destination (a debit card in CA) and account eligibility.

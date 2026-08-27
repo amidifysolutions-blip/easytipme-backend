@@ -174,7 +174,17 @@ app.post('/create-payment-intent', async (req, res) => {
     // server-side, so the limit holds no matter what the browser sends. A tip
     // below the minimum can cost more in Stripe fees than the commission earns
     // (especially in currencies that get no fixed fee — see MAJOR_CUR below).
-    const minTipUnits = (cfgData.minTip != null && !isNaN(Number(cfgData.minTip))) ? Number(cfgData.minTip) : 1;
+    // The minimum is per CURRENCY: "3" means $3 in CAD/USD, but 3 AED is under a
+    // dollar and still loses money after Stripe's fixed fee. Currencies without
+    // our fixed fee (see MAJOR_CUR below) therefore need a higher floor. Set
+    // config/platform.minTipByCurrency = { aed: 12, sar: 12, ... } to override.
+    const curKey = String(cur || '').toLowerCase();
+    const minByCur = (cfgData.minTipByCurrency && typeof cfgData.minTipByCurrency === 'object') ? cfgData.minTipByCurrency : {};
+    const MINOR_CUR_DEFAULT = { aed: 12, sar: 12, qar: 12, lbp: 300000, egp: 150 };
+    let minTipUnits;
+    if (minByCur[curKey] != null && !isNaN(Number(minByCur[curKey]))) minTipUnits = Number(minByCur[curKey]);
+    else if (MINOR_CUR_DEFAULT[curKey] != null) minTipUnits = MINOR_CUR_DEFAULT[curKey];
+    else minTipUnits = (cfgData.minTip != null && !isNaN(Number(cfgData.minTip))) ? Number(cfgData.minTip) : 1;
     const maxTipUnits = (cfgData.maxTip != null && !isNaN(Number(cfgData.maxTip))) ? Number(cfgData.maxTip) : 1000;
     if (tip < Math.round(minTipUnits * 100)) return res.status(400).json({ error: 'tip-too-small', minTip: minTipUnits });
     if (tip > Math.round(maxTipUnits * 100)) return res.status(400).json({ error: 'tip-too-large', maxTip: maxTipUnits });

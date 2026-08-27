@@ -179,7 +179,7 @@ app.post('/create-payment-intent', async (req, res) => {
     // config/platform.minTipByCurrency = { aed: 5, sar: 5, ... } to override.
     const curKey = String(cur || '').toLowerCase();
     const minByCur = (cfgData.minTipByCurrency && typeof cfgData.minTipByCurrency === 'object') ? cfgData.minTipByCurrency : {};
-    const MINOR_CUR_DEFAULT = { aed: 5, sar: 5, qar: 5, lbp: 100000, egp: 50 };
+    const MINOR_CUR_DEFAULT = { sek: 30, nok: 30, dkk: 20, pln: 12, czk: 70, huf: 1000, ron: 14, bgn: 6 };
     let minTipUnits;
     if (minByCur[curKey] != null && !isNaN(Number(minByCur[curKey]))) minTipUnits = Number(minByCur[curKey]);
     else if (MINOR_CUR_DEFAULT[curKey] != null) minTipUnits = MINOR_CUR_DEFAULT[curKey];
@@ -208,21 +208,27 @@ app.post('/create-payment-intent', async (req, res) => {
     const SP_HOME = (cfgData.stripePercentHome != null && !isNaN(Number(cfgData.stripePercentHome))) ? Number(cfgData.stripePercentHome) : 2.9;
     const SP_AWAY = (cfgData.stripePercentForeign != null && !isNaN(Number(cfgData.stripePercentForeign))) ? Number(cfgData.stripePercentForeign) : 5.7;
 
-    // What Stripe's FIXED fee (C$0.30) costs us, expressed in each currency.
-    // Approximate for markets we have not launched in yet — verify against a real
-    // Balance transaction before opening a market, and override any value from the
-    // admin panel (config/platform.commissionFixedByCurrency sets the CHARGED
-    // amount directly and skips this maths entirely).
+    // Currencies we can ACTUALLY operate in. A Canadian platform can only pay out
+    // to connected accounts in CA / US / UK / EEA / CH (Stripe cross-border
+    // payouts), so a worker in Egypt, Lebanon, Saudi Arabia, Qatar, Kuwait,
+    // Jordan, Morocco or Turkey cannot be paid at all, whatever currency the
+    // customer taps in. Do NOT add a currency here until a worker in that
+    // country can actually receive the money.
+    //
+    // Values = what Stripe's fixed fee costs us in that currency. Our account is
+    // Canadian, so the fee is always C$0.30 converted, not the local country's
+    // published fixed fee. Override from the admin panel via
+    // config/platform.commissionFixedByCurrency, which sets the CHARGED amount
+    // directly and skips this maths entirely.
     const STRIPE_FIXED_BY_CUR = {
-      cad: 0.30, usd: 0.22, eur: 0.20, gbp: 0.17, aud: 0.34, nzd: 0.37, chf: 0.19,
-      aed: 0.80, sar: 0.82, qar: 0.80, jod: 0.16, kwd: 0.07, bhd: 0.09, omr: 0.09,
-      egp: 10.5, lbp: 19500, try: 9, mad: 2.2, tnd: 0.65, ils: 0.81,
-      sek: 2.2, nok: 2.3, dkk: 1.5, pln: 0.87, czk: 4.8, ron: 1.0, huf: 78, isk: 30,
-      jpy: 33, cny: 1.55, hkd: 1.7, twd: 6.9, krw: 300, sgd: 0.28, myr: 0.93,
-      thb: 7.5, php: 12.5, idr: 3600, inr: 18.5, vnd: 5550, pkr: 62, bdt: 26,
-      brl: 1.2, mxn: 4.2, ars: 300, clp: 210, cop: 870, pen: 0.81, uyu: 8.7,
-      zar: 3.9, ngn: 330, kes: 28.5, ghs: 2.7,
+      cad: 0.30,                                            // Canada (home)
+      usd: 0.22, gbp: 0.17, eur: 0.20, chf: 0.19,           // US, UK, eurozone, Switzerland
+      sek: 2.2, nok: 2.3, dkk: 1.5,                         // Nordics
+      pln: 0.87, czk: 4.8, huf: 78, ron: 1.0, bgn: 0.40,    // rest of the EEA
     };
+    // Cross-border payout fee: paying a worker outside Canada costs an extra
+    // 0.25% of the payout. Waived within the EEA, but we are not an EEA platform.
+    const XB_PCT = (cfgData.crossBorderPercent != null && !isNaN(Number(cfgData.crossBorderPercent))) ? Number(cfgData.crossBorderPercent) : 0.25;
     // Round a money amount UP to ~2 significant figures, so FX drift is absorbed
     // by us charging a hair more, never by us quietly losing money.
     function tidyUp(v) {
@@ -232,7 +238,7 @@ app.post('/create-payment-intent', async (req, res) => {
     }
     const isHome = (cur === HOME_CUR);
     const sp = (isHome ? SP_HOME : SP_AWAY) / 100;
-    const costPlusPct = Math.round(((TARGET_NET / 100 + sp) / (1 - sp)) * 1000) / 10;
+    const costPlusPct = Math.round(((TARGET_NET / 100 + (isHome ? 0 : XB_PCT / 100) + sp) / (1 - sp)) * 1000) / 10;
     const stripeFixedHere = STRIPE_FIXED_BY_CUR[cur];
     const costPlusFixed = (stripeFixedHere != null) ? tidyUp(stripeFixedHere / (1 - sp)) : null;
 

@@ -2352,6 +2352,82 @@ app.post('/partners/payout-details', async (req, res) => {
   } catch (e) { console.error('partners payout-details', e.message); res.status(500).json({ error: e.message }); }
 });
 
+// ---- Admin view of the partner programme -----------------------------------
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'amidifysolutions@gmail.com')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+async function requireAdmin(req, res) {
+  const decoded = await requirePartner(req, res); if (!decoded) return null;
+  const email = (decoded.email || '').toLowerCase();
+  if (!ADMIN_EMAILS.includes(email)) { res.status(403).json({ error: 'not-admin' }); return null; }
+  return decoded;
+}
+
+app.post('/partners/admin/list', async (req, res) => {
+  try {
+    const decoded = await requireAdmin(req, res); if (!decoded) return;
+    const snap = await adminDb.collection('partners').get();
+    const out = [];
+    snap.forEach(d => {
+      const p = d.data();
+      const r = partnerRateFor(p);
+      out.push({
+        uid: d.id, name: p.name || '', email: p.email || '', code: p.code || '',
+        status: p.status || 'active', tier: r.tier, rate: r.rate, baseRate: r.baseRate, stepsDown: r.steps,
+        activeClients: p.activeClients || 0, totalReferred: p.totalReferred || 0,
+        accrued: (p.accruedCents || 0) / 100, paid: (p.paidCents || 0) / 100,
+        payoutMethod: p.payoutMethod || null, stripeReady: !!p.stripePayoutsEnabled,
+        customRate: p.customRate != null ? p.customRate : null,
+      });
+    });
+    out.sort((a, b) => b.accrued - a.accrued);
+    res.json({ ok: true, partners: out });
+  } catch (e) { console.error('partners admin list', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Record that a partner has been paid: moves their accrued balance to paid and
+// leaves a receipt line. Money itself is sent outside this call.
+app.post('/partners/admin/mark-paid', async (req, res) => {
+  try {
+    const decoded = await requireAdmin(req, res); if (!decoded) return;
+    const uid = String((req.body && req.body.uid) || '');
+    if (!uid) return res.status(400).json({ error: 'missing-uid' });
+    const pRef = adminDb.collection('partners').doc(uid);
+    const snap = await pRef.get();
+    if (!snap.exists) return res.status(404).json({ error: 'not-found' });
+    const p = snap.data();
+    const amountCents = Math.round(Number(req.body.amount != null ? req.body.amount * 100 : (p.accruedCents || 0)));
+    if (!(amountCents > 0)) return res.status(400).json({ error: 'nothing-to-pay' });
+    if (amountCents > (p.accruedCents || 0)) return res.status(400).json({ error: 'more-than-owed' });
+    await pRef.update({
+      accruedCents: FieldValue.increment(-amountCents),
+      paidCents: FieldValue.increment(amountCents),
+    });
+    await pRef.collection('payouts').add({
+      amountCents, method: (p.payoutMethod && p.payoutMethod.type) || (p.stripePayoutsEnabled ? 'stripe' : 'manual'),
+      byEmail: (decoded.email || '').toLowerCase(), createdMs: Date.now(),
+    });
+    res.json({ ok: true, paid: amountCents / 100 });
+  } catch (e) { console.error('partners mark-paid', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Set (or clear) a custom rate for one partner.
+app.post('/partners/admin/set-rate', async (req, res) => {
+  try {
+    const decoded = await requireAdmin(req, res); if (!decoded) return;
+    const uid = String((req.body && req.body.uid) || '');
+    if (!uid) return res.status(400).json({ error: 'missing-uid' });
+    const raw = req.body.rate;
+    if (raw === null || raw === '' || raw === undefined) {
+      await adminDb.collection('partners').doc(uid).update({ customRate: FieldValue.delete() });
+      return res.json({ ok: true, cleared: true });
+    }
+    const rate = Number(raw);
+    if (isNaN(rate) || rate < 0 || rate > 60) return res.status(400).json({ error: 'bad-rate' });
+    await adminDb.collection('partners').doc(uid).update({ customRate: rate });
+    res.json({ ok: true, rate });
+  } catch (e) { console.error('partners set-rate', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Monthly commission accrual. For each venue that has a partner, work out what
 // we ACTUALLY kept last month (gross commission minus Stripe's cut, plus the $2
 // worker fees, which carry no card cost) and credit the partner's share of that.

@@ -2043,20 +2043,17 @@ app.post('/connect/withdraw', async (req, res) => {
 // pushed to THEIR OWN linked bank so it becomes part of their personal funds/
 // estate instead of being frozen with us.
 //
-// Legally safe for closed-work-permit workers: this fires at most ~twice a year
+// Legally safe for closed-work-permit workers: this fires at most ~4 times a year
 // per worker, so the bank line is an occasional "TIP" lump — never salary-like.
 //
 // Self-limiting: for each worker account we only sweep if the LAST payout of any
-// kind was > 6 months ago (or, if never paid out, the account is > 6 months old)
-// AND the available balance is >= $5. Because of the per-account 6-month check,
+// kind was > 3 months ago (or, if never paid out, the account is > 3 months old)
+// AND the available balance is >= $5. Because of the per-account 3-month check,
 // the scheduler can call this as often as it likes with no double-sweeps.
-//
-// Triggered by a scheduled Cloud Function (Cloud Scheduler) that POSTs here with
-// the shared CRON_SECRET. Not reachable without that secret.
 // Core safety-net sweep. Shared by the HTTP endpoint (below) and by the
 // internal daily timer, so the net works with no external scheduler at all.
 async function runIdleSweep() {
-    const SIX_MONTHS = 183 * 24 * 60 * 60; // seconds
+    const IDLE_WINDOW = 92 * 24 * 60 * 60; // seconds (~3 months)
     const MIN_CENTS = 500;                  // only sweep >= $5 available
     const nowSec = Math.floor(Date.now() / 1000);
     const swept = [];
@@ -2082,14 +2079,14 @@ async function runIdleSweep() {
           const pl = await connectStripe.payouts.list({ limit: 1 }, hdr);
           const lastPayoutSec = (pl.data[0] && pl.data[0].created) ? pl.data[0].created : null;
           const refSec = lastPayoutSec || acc.created || nowSec;
-          if (nowSec - refSec < SIX_MONTHS) continue;
+          if (nowSec - refSec < IDLE_WINDOW) continue;
 
           considered++;
           // Belt-and-suspenders: keep the account on manual payouts.
           try { await connectStripe.accounts.update(acc.id, { settings: { payouts: { schedule: { interval: 'manual' } } } }); } catch (_) {}
           for (const b of buckets) {
             const p = await connectStripe.payouts.create(
-              { amount: b.amount, currency: b.currency, statement_descriptor: 'TIP', metadata: { kind: 'auto-sweep-6mo', staffId: acc.metadata.staffId } },
+              { amount: b.amount, currency: b.currency, statement_descriptor: 'TIP', metadata: { kind: 'auto-sweep-3mo', staffId: acc.metadata.staffId } },
               hdr
             );
             swept.push({ account: acc.id, staffId: acc.metadata.staffId, amount: p.amount / 100, currency: p.currency });
@@ -2118,7 +2115,7 @@ app.post('/cron/sweep-idle-balances', async (req, res) => {
 // Internal scheduler: the safety net runs itself about once a day while the
 // server is up — no external cron, no secret, no dashboard to configure. The
 // sweep is self-limiting (an account only moves if its last payout was over
-// 6 months ago), so an extra run is harmless.
+// 3 months ago), so an extra run is harmless.
 const SWEEP_EVERY_MS = 24 * 60 * 60 * 1000;
 let _lastSweepMs = 0;
 async function maybeRunSweep(tag) {

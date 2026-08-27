@@ -2053,12 +2053,9 @@ app.post('/connect/withdraw', async (req, res) => {
 //
 // Triggered by a scheduled Cloud Function (Cloud Scheduler) that POSTs here with
 // the shared CRON_SECRET. Not reachable without that secret.
-app.post('/cron/sweep-idle-balances', async (req, res) => {
-  try {
-    const secret = req.headers['x-cron-secret'] || (req.body && req.body.secret);
-    if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
+// Core safety-net sweep. Shared by the HTTP endpoint (below) and by the
+// internal daily timer, so the net works with no external scheduler at all.
+async function runIdleSweep() {
     const SIX_MONTHS = 183 * 24 * 60 * 60; // seconds
     const MIN_CENTS = 500;                  // only sweep >= $5 available
     const nowSec = Math.floor(Date.now() / 1000);
@@ -2104,9 +2101,36 @@ app.post('/cron/sweep-idle-balances', async (req, res) => {
     }
 
     console.log(`sweep-idle: scanned=${scanned} considered=${considered} swept=${swept.length}`);
-    res.json({ ok: true, scanned, considered, swept });
+    return { ok: true, scanned, considered, swept };
+}
+
+// On-demand trigger (kept for manual runs). Requires CRON_SECRET to be set.
+app.post('/cron/sweep-idle-balances', async (req, res) => {
+  try {
+    const secret = req.headers['x-cron-secret'] || (req.body && req.body.secret);
+    if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    res.json(await runIdleSweep());
   } catch (e) { console.error('sweep-idle', e.message); res.status(500).json({ error: e.message }); }
 });
+
+// Internal scheduler: the safety net runs itself about once a day while the
+// server is up — no external cron, no secret, no dashboard to configure. The
+// sweep is self-limiting (an account only moves if its last payout was over
+// 6 months ago), so an extra run is harmless.
+const SWEEP_EVERY_MS = 24 * 60 * 60 * 1000;
+let _lastSweepMs = 0;
+async function maybeRunSweep(tag) {
+  if (Date.now() - _lastSweepMs < SWEEP_EVERY_MS) return;
+  _lastSweepMs = Date.now();
+  try {
+    const r = await runIdleSweep();
+    console.log('auto-sweep', tag, 'scanned=' + r.scanned, 'swept=' + r.swept.length);
+  } catch (e) { console.error('auto-sweep', tag, e && e.message); }
+}
+setTimeout(() => maybeRunSweep('boot'), 5 * 60 * 1000);          // 5 min after boot
+setInterval(() => maybeRunSweep('daily'), 6 * 60 * 60 * 1000);   // re-check every 6h
 
 // Release tips that were held while a worker hadn't finished connecting their
 // bank. Called by the worker's app once their Connect account is ready. Finds

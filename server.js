@@ -170,10 +170,26 @@ app.post('/create-payment-intent', async (req, res) => {
     let cfgData = {};
     try { const cfg = await adminDb.collection('config').doc('platform').get(); if (cfg.exists) cfgData = cfg.data() || {}; } catch (_) {}
 
+    // Minimum / maximum tip. Both live in config/platform and are enforced HERE,
+    // server-side, so the limit holds no matter what the browser sends. A tip
+    // below the minimum can cost more in Stripe fees than the commission earns
+    // (especially in currencies that get no fixed fee — see MAJOR_CUR below).
+    const minTipUnits = (cfgData.minTip != null && !isNaN(Number(cfgData.minTip))) ? Number(cfgData.minTip) : 1;
+    const maxTipUnits = (cfgData.maxTip != null && !isNaN(Number(cfgData.maxTip))) ? Number(cfgData.maxTip) : 1000;
+    if (tip < Math.round(minTipUnits * 100)) return res.status(400).json({ error: 'tip-too-small', minTip: minTipUnits });
+    if (tip > Math.round(maxTipUnits * 100)) return res.status(400).json({ error: 'tip-too-large', maxTip: maxTipUnits });
+
+    // Floor: a per-shop rate may be raised for a shop, but never dropped below the
+    // platform minimum (default 10%), so no shop can be configured into a loss —
+    // whether by mistake in the admin panel or by a stale/legacy shop record.
+    let MIN_COMM_PCT = 10;
+    if (cfgData.minCommissionPercent != null && !isNaN(Number(cfgData.minCommissionPercent))) MIN_COMM_PCT = Number(cfgData.minCommissionPercent);
+
     let commPct = null;
     if (biz.commissionPercent != null && !isNaN(Number(biz.commissionPercent))) commPct = Number(biz.commissionPercent);
     else if (cfgData.commissionPercent != null) commPct = Number(cfgData.commissionPercent);
-    if (commPct == null || !(commPct >= 0)) commPct = 7;
+    if (commPct == null || !(commPct >= 0)) commPct = MIN_COMM_PCT;
+    if (commPct < MIN_COMM_PCT) commPct = MIN_COMM_PCT;
 
     let commFixed = null;   // in the tip's currency units (e.g. 0.30 = $0.30)
     if (biz.commissionFixed != null && !isNaN(Number(biz.commissionFixed))) commFixed = Number(biz.commissionFixed);

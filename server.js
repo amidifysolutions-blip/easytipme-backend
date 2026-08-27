@@ -2504,6 +2504,70 @@ async function accruePartnerCommissions(period) {
   return { ok: true, period: target, venues, credited: results };
 }
 
+// ---- Automatic partner payouts via Stripe ----------------------------------
+// Once commission is accrued, partners who connected Stripe are paid AUTOMATICALLY
+// — no manual step. Money moves from the platform balance to the partner's own
+// connected account, and from there Stripe pays it out to their bank.
+// Any transfer cost is borne by the PARTNER: set config/platform.partnerTransferFeePercent
+// and it is deducted from their amount before sending.
+async function payPartnersViaStripe() {
+  if (!adminDb) return { ok: false, error: 'admin-not-configured' };
+  let cfg = {};
+  try { const c = await adminDb.collection('config').doc('platform').get(); if (c.exists) cfg = c.data() || {}; } catch (_) {}
+  const currency = String(cfg.partnerPayoutCurrency || 'cad').toLowerCase();
+  const feePct = Number(cfg.partnerTransferFeePercent || 0);   // charged to the partner
+
+  const snap = await adminDb.collection('partners').get();
+  const paid = [], skipped = [];
+  for (const d of snap.docs) {
+    const p = d.data();
+    const owed = Number(p.accruedCents || 0);
+    try {
+      if (p.status === 'suspended') { skipped.push({ uid: d.id, why: 'suspended' }); continue; }
+      if (owed < PARTNER_MIN_PAYOUT_CENTS) { skipped.push({ uid: d.id, why: 'below-minimum' }); continue; }
+      if (!p.stripeAccountId || !p.stripePayoutsEnabled) { skipped.push({ uid: d.id, why: 'no-stripe' }); continue; }
+
+      const fee = Math.round(owed * feePct / 100);
+      const amount = owed - fee;
+      if (amount <= 0) { skipped.push({ uid: d.id, why: 'fee-exceeds-amount' }); continue; }
+
+      // Idempotency: one transfer per partner per month, even if this re-runs.
+      const period = periodKey(new Date());
+      const tr = await connectStripe.transfers.create({
+        amount, currency, destination: p.stripeAccountId,
+        description: 'EasyTipMe partner commission',
+        metadata: { partnerUid: d.id, period, owedCents: String(owed), feeCents: String(fee) },
+      }, { idempotencyKey: 'partner-payout-' + d.id + '-' + period });
+
+      await d.ref.update({
+        accruedCents: FieldValue.increment(-owed),
+        paidCents: FieldValue.increment(amount),
+        lastPayoutMs: Date.now(),
+      });
+      await d.ref.collection('payouts').add({
+        amountCents: amount, feeCents: fee, currency, method: 'stripe',
+        transferId: tr.id, period, auto: true, createdMs: Date.now(),
+      });
+      paid.push({ uid: d.id, amount: amount / 100, fee: fee / 100 });
+    } catch (e) {
+      // Insufficient platform balance or a Stripe error — leave the balance owed
+      // and try again next run. Never lose what a partner has earned.
+      console.error('partner payout', d.id, e.message);
+      skipped.push({ uid: d.id, why: e.message });
+    }
+  }
+  console.log('partner-payouts', 'paid=' + paid.length, 'skipped=' + skipped.length);
+  return { ok: true, paid, skipped };
+}
+
+app.post('/partners/payout-run', async (req, res) => {
+  try {
+    const secret = req.headers['x-cron-secret'] || (req.body && req.body.secret);
+    if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) return res.status(403).json({ error: 'forbidden' });
+    res.json(await payPartnersViaStripe());
+  } catch (e) { console.error('partners payout-run', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // Manual/admin trigger (same secret as the sweep).
 app.post('/partners/accrue', async (req, res) => {
   try {
@@ -2526,6 +2590,8 @@ async function maybeAccrue() {
     if (marker && marker.exists && marker.data().lastPeriod === target) return;   // already done
     const r = await accruePartnerCommissions(target);
     if (r.ok && adminDb) await adminDb.collection('config').doc('partnerAccrual').set({ lastPeriod: target, ranMs: Date.now() }, { merge: true });
+    // Accrue, then pay — partners on Stripe are paid without any manual step.
+    if (r.ok) { try { await payPartnersViaStripe(); } catch (e) { console.error('auto-payout', e && e.message); } }
   } catch (e) { console.error('auto-accrual', e && e.message); }
 }
 setTimeout(maybeAccrue, 7 * 60 * 1000);
